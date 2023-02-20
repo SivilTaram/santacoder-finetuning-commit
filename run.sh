@@ -1,0 +1,15 @@
+deepspeed train.py \
+      --max_input_length 2048 \
+      --max_steps 30000 \
+      --batch_size 2 \
+      --gradient_accumulation_steps 2 \
+      --learning_rate 5e-5 \
+      --num_warmup_steps 1000 \
+      --eval_freq 3000 \
+      --save_freq 3000 \
+      --log_freq 10 \
+      --num_workers 16 \
+      --bf16 \
+      --deepspeed zero_stage1_config.json \
+      --cache_dir /tmp/datasets/santacoder-github-commit \
+      --output_dir /tmp/checkpoints/santacoder_v1
