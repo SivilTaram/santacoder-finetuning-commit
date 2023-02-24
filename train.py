@@ -89,10 +89,20 @@ def get_too_common_message(dataset, nb_examples=10_0000):
     return set(common_message.keys())
 
 
+def subsample_java():
+    pass
+
+
 def commit_diff(example):
-    example["diff"] = "\n".join([line for line in difflib.unified_diff(example["old_contents"].splitlines(),
-                                                                       example["new_contents"].splitlines())
-                                 if line.startswith("+") or line.startswith("-")][2:])
+    old_lines = example["old_contents"].splitlines()
+    new_lines = example["new_contents"].splitlines()
+
+    diff_lines = (line for line in difflib.unified_diff(old_lines, new_lines) if
+                  line.startswith("+") or line.startswith("-"))
+    result = ""
+    for line in diff_lines[2:]:
+        result += line + "\n"
+    example["diff"] = result
     return example
 
 
@@ -103,7 +113,8 @@ tokenizer.sep_token = tokenizer.eos_token
 
 def preprocess_function(examples, args):
     # input as old content + message, output as code edits
-    inputs = [message + " : " + old_content + tokenizer.eos_token + diff_content
+    inputs = ["Please follow the following instruction to modify the code:" + message + "\n\n" + old_content +
+              tokenizer.eos_token + diff_content
               for message, old_content, diff_content in zip(examples["message"],
                                                             examples["old_contents"],
                                                             examples["diff"])]
@@ -124,7 +135,7 @@ def create_datasets(args):
         use_auth_token=True,
         num_proc=args.num_workers if not args.streaming else None,
         streaming=args.streaming,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
         # data_files="diffs_55574529_56098816.jsonl"
     )
 
@@ -133,19 +144,21 @@ def create_datasets(args):
     print(f"The character to token ratio of the content is: {chars_per_token_content:.2f}")
     print(f"The character to token ratio of the message is: {chars_per_token_message:.2f}")
 
-    common_message = get_too_common_message(dataset)
+    # common_message = get_too_common_message(dataset)
 
     # filter all datasets which are not positive
     def valid_filter_dataset(example):
         return example["new_contents"] != example["old_contents"] and \
+               len(example["old_contents"]) < 50_000 and \
                len(example["new_contents"].strip()) > 0 and \
-               len(example["old_contents"].strip()) > 0 and \
-               example["message"] not in common_message and \
-               len(example["old_contents"]) < 50_000
+               len(example["old_contents"].strip()) > 0
 
+    print(f"The size of dataset is: {len(dataset):.2f}")
     # filter the dataset
     dataset = dataset.filter(valid_filter_dataset,
                              num_proc=args.num_workers)
+
+    print(f"The size of dataset after valid_filtering is: {len(dataset):.2f}")
 
     dataset = dataset.map(commit_diff,
                           num_proc=args.num_workers)
@@ -164,8 +177,14 @@ def create_datasets(args):
 
     # filter the dataset
     dataset = dataset.filter(length_filter_dataset,
-                             num_proc=args.num_workers) \
-        .filter(prefix_filter_dataset, num_proc=args.num_workers)
+                             num_proc=args.num_workers)
+
+    print(f"The size of dataset after length_filtering is: {len(dataset):.2f}")
+
+    dataset = dataset.filter(prefix_filter_dataset,
+                             num_proc=args.num_workers)
+
+    print(f"The size of dataset after prefix_filtering is: {len(dataset):.2f}")
 
     if args.streaming:
         print("Loading the dataset in streaming mode")
@@ -179,6 +198,8 @@ def create_datasets(args):
         print(
             f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}"
         )
+    for i in range(10):
+        print(train_data[i])
 
     column_names = dataset.column_names["train"]
     train_dataset = train_data.map(
