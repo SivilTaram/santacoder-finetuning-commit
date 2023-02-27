@@ -34,7 +34,7 @@ def get_args():
     parser.add_argument("--cache_dir", type=str, default="/tmp/santacoder-github-commit")
     parser.add_argument("--size_valid_set", type=int, default=5000)
     parser.add_argument("--streaming", action="store_true")
-    parser.add_argument("--shuffle_buffer", type=int, default=5000)
+    parser.add_argument("--shuffle_buffer", type=int, default=12800)
 
     parser.add_argument("--max_input_length", type=int, default=2048)
     parser.add_argument("--max_steps", type=int, default=10000)
@@ -161,7 +161,8 @@ class GithubCommitDataset(IterableDataset):
             tokenizer,
             dataset,
             infinite=False,
-            seq_length=2048
+            seq_length=2048,
+            num_of_sequences=12800
     ):
         self.tokenizer = tokenizer
         self.concat_token_id = (
@@ -170,29 +171,38 @@ class GithubCommitDataset(IterableDataset):
         self.dataset = dataset
         self.seq_length = seq_length
         self.infinite = infinite
+        self.num_of_sequences = num_of_sequences
 
     def __iter__(self):
         iterator = iter(self.dataset)
         more_examples = True
-        example_input = ""
         while more_examples:
-            try:
-                example = next(iterator)
-                example_input = "Please follow the following instruction to modify the code: {message}\n\n{old_contents}\n{eos} {diff_content}".format(
-                    message=example["message"].strip(), old_contents=example["old_contents"],
-                    eos=self.tokenizer.eos_token, diff_content=example["diff"])
-            except StopIteration:
-                if self.infinite:
-                    iterator = iter(self.dataset)
-                else:
-                    more_examples = False
+            buffer, buffer_len = [], 0
+            while True:
+                if buffer_len >= self.num_of_sequences:
                     break
-            model_inputs = self.tokenizer(example_input,
+                try:
+                    example = next(iterator)
+                    example_input = "Please follow the following instruction to modify the code: {message}\n\n{old_contents}\n{eos} {diff_content}".format(
+                        message=example["message"].strip(), old_contents=example["old_contents"],
+                        eos=self.tokenizer.eos_token, diff_content=example["diff"])
+                    buffer.append(example_input)
+                    buffer_len += 1
+                except StopIteration:
+                    if self.infinite:
+                        iterator = iter(self.dataset)
+                    else:
+                        more_examples = False
+                        break
+            model_inputs = self.tokenizer(buffer,
                                           max_length=self.seq_length,
                                           padding="max_length",
                                           truncation=True)
-            model_inputs["labels"] = model_inputs["input_ids"].copy()
-            yield model_inputs
+            for encoding_input in model_inputs["input_ids"]:
+                yield {
+                    "input_ids": torch.LongTensor(encoding_input),
+                    "labels": torch.LongTensor(encoding_input)
+                }
 
 
 def preprocess_function(examples, args):
@@ -282,12 +292,14 @@ def create_datasets(args):
             tokenizer=tokenizer,
             dataset=train_data,
             infinite=True,
+            num_of_sequences=1024,
             seq_length=args.max_input_length
         )
         valid_dataset = GithubCommitDataset(
             tokenizer=tokenizer,
             dataset=valid_data,
             infinite=False,
+            num_of_sequences=1024,
             seq_length=args.max_input_length
         )
     else:
@@ -350,7 +362,7 @@ def run_training(args, train_data, val_data):
         deepspeed=args.deepspeed,
         weight_decay=args.weight_decay,
         run_name=args.output_dir,
-        # report_to="wandb"
+        report_to="wandb"
     )
     # Data collator
     data_collator = DataCollatorWithPadding(
