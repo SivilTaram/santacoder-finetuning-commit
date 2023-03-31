@@ -8,15 +8,20 @@ import numpy as np
 from datasets import load_dataset, concatenate_datasets
 from huggingface_hub import hf_hub_download
 
-CACHE_DIR = "YOU_CACHE_DIR"
+CACHE_DIR = "/dev/cache/qian/datasets/instruction-commits"
 DATASET_NAME = "bigcode/instruction-commits"
-PUSH_DATASET_NAME = "bigcode/instruction-commits-filter"
+PUSH_DATASET_NAME = "SivilTaram/instruction-commits-high-sampling"
 
 # 1.0 mean keep all short commit messages
-SHORT_SAMPLING = 1.0
+SHORT_SAMPLING = 0.2
 LONG_SAMPLING = 0.1
 MD_SAMPLING = 1.0
 DATA_SAMPLING = 1.0
+
+# repeat time of the whole dataset
+SAMPLE_TIME = 3
+PROBA_THRESHOLD = 0.1
+LOW_QUALITY_SAMPLING = 0.1
 
 # the ratio to control how many examples are fully shown in the model input, 0.2 means 20% examples will have
 # the full code context such as the whole code file as the input
@@ -166,7 +171,21 @@ ds = concatenate_datasets(ds_list)
 
 print("The dataset size is: {}".format(len(ds)))
 
-ds = ds.filter(lambda x: x["proba"] >= 0.9, num_proc=30)
+
+# repeat the dataset to make it larger
+ds = concatenate_datasets([ds] * SAMPLE_TIME)
+
+
+def sub_sampling_based_on_proba(example):
+    proba = example["proba"]
+    if proba > PROBA_THRESHOLD:
+        return True
+    elif random.random() < LOW_QUALITY_SAMPLING:
+        return True
+    return False
+
+
+# ds = ds.filter(lambda x: x["proba"] >= 0.9, num_proc=30)
 
 print("After proba filtering, the dataset size is: {}".format(len(ds)))
 
@@ -230,6 +249,9 @@ ds_clean = ds.filter(commit_filter, num_proc=30)
 
 print("After commit filtering, the dataset size is {}".format(len(ds_clean)))
 
+ds_clean = ds_clean.filter(sub_sampling_based_on_proba, num_proc=30)
+print("After high proba filtering, the dataset size is {}".format(len(ds_clean)))
+
 
 def prepare_code(example):
     if np.random.random() < FULL_RANGE_FRAC:
@@ -263,4 +285,12 @@ ds_final = ds_clean.remove_columns(
      'n_changes', 'drop_opt_out'])
 
 print("Finish the data cleaning, the final dataset size is {}".format(len(ds_final)))
+
+# add metadata
+ds_final.description = "The dataset is built with the following hyper-parameter: \n"\
+                       f"FULL_RANGE_FRAC: {FULL_RANGE_FRAC}, MIN_RANGE: {MIN_RANGE}, MAX_RANGE: {MAX_RANGE}, "\
+                        f"PROBA_THRESHOLD: {PROBA_THRESHOLD}, SHORT_SAMPLING: {SHORT_SAMPLING}, "\
+                        f"LONG_SAMPLING: {LONG_SAMPLING}, MD_SAMPLING: {MD_SAMPLING}, DATA_SAMPLING: {DATA_SAMPLING}, "\
+                        f"LOW_QUALITY_SAMPLING: {LOW_QUALITY_SAMPLING}, SAMPLE_TIME: {SAMPLE_TIME}"
+
 ds_final.push_to_hub(PUSH_DATASET_NAME, private=True)
