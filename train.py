@@ -22,8 +22,8 @@ from transformers import (
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="bigcode/santacoder")
-    parser.add_argument("--dataset_name", type=str, default="bigcode/git-commits-cleaned")
-    parser.add_argument("--subset", type=str, default="data")
+    parser.add_argument("--dataset_name", type=str, default="bigcode/instruction-commits")
+    # parser.add_argument("--subset", type=str, default="data")
     parser.add_argument("--split", type=str, default="train")
     parser.add_argument("--cache_dir", type=str, default="/tmp/santacoder-github-cleaned")
     parser.add_argument("--size_valid_set", type=int, default=5000)
@@ -55,6 +55,7 @@ def get_args():
     parser.add_argument("--eval_freq", default=1000, type=int)
     parser.add_argument("--save_freq", default=1000, type=int)
     parser.add_argument("--predict_with_generate", action="store_true")
+    parser.add_argument("--compute_loss_on_input", default=False, action="store_true")
     return parser.parse_args()
 
 
@@ -64,28 +65,49 @@ tokenizer.sep_token = tokenizer.eos_token
 
 
 def preprocess_function(examples, args):
-    inputs = examples["content"]
-    # print(inputs[0])
+    old_content = ["<commit_before>{}".format(content) for content in examples["old_contents"]]
+    commit_message = ["<commit_msg>{}".format(content) for content in examples["subject"]]
+    new_content = ["<commit_after>{}".format(content) for content in examples["new_contents"]]
+    inputs = [old_example + commit_example + new_example
+              for old_example, commit_example, new_example in
+              zip(old_content, commit_message, new_content)]
     model_inputs = tokenizer(inputs,
                              max_length=args.max_input_length,
                              padding="max_length",
                              truncation=True)
-    model_inputs["labels"] = model_inputs["input_ids"].copy()
+    if args.compute_loss_on_input:
+        model_inputs["labels"] = model_inputs["input_ids"].copy()
+    else:
+        old_plus_message = [old_example + commit_example
+                            for old_example, commit_example in
+                            zip(old_content, commit_message)]
+        old_plus_message_ids = tokenizer(old_plus_message,
+                                         max_length=args.max_input_length,
+                                         padding=False,
+                                         truncation=True)["input_ids"]
+        # -100 means this part of input will not be used in loss computation
+        old_plus_message_prefix = ["".join([tokenizer.eos_token] * len(ids)) for ids in old_plus_message_ids]
+        model_targets = [pad_prefix + new_example for pad_prefix, new_example in
+                         zip(old_plus_message_prefix, new_content)]
+        labels = tokenizer(model_targets, max_length=args.max_input_length, padding="max_length", truncation=True)
+        labels["input_ids"] = [[-100 if l_tok == tokenizer.eos_token_id else l_tok
+                                for l_tok in label] for label in labels["input_ids"]]
+        model_inputs["labels"] = labels["input_ids"]
+
     return model_inputs
 
 
 def create_datasets(args):
     dataset = load_dataset(
         args.dataset_name,
-        data_dir=args.subset,
         split=args.split,
         use_auth_token=True,
         num_proc=args.num_workers if not args.streaming else None,
         streaming=args.streaming,
-        cache_dir=args.cache_dir
+        cache_dir=args.cache_dir,
+        data_files="data/python/python-0001.jsonl",
     )
 
-    # common_message = get_too_common_message(dataset)
     dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
     train_data = dataset["train"]
     valid_data = dataset["test"]
@@ -182,7 +204,7 @@ def run_training(args, train_data, val_data):
         eval_dataset=val_data,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        # compute_metrics=compute_metrics if args.predict_with_generate else None
+        compute_metrics=compute_metrics if args.predict_with_generate else None
     )
 
     print("Training...")
