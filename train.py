@@ -6,6 +6,7 @@ import argparse
 import os
 from functools import partial
 
+import torch.cuda
 from datasets import load_dataset
 from datasets import load_metric
 from transformers import (
@@ -16,6 +17,7 @@ from transformers import (
     TrainingArguments,
     logging,
     set_seed,
+    TrainerCallback
 )
 
 
@@ -33,7 +35,7 @@ def get_args():
     parser.add_argument("--max_input_length", type=int, default=2048)
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--message_min_token", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--eos_token_id", type=int, default=49152)
 
@@ -65,9 +67,16 @@ tokenizer.sep_token = tokenizer.eos_token
 
 
 def preprocess_function(examples, args):
-    old_content = ["<commit_before>{}".format(content) for content in examples["old_contents"]]
-    commit_message = ["<commit_msg>{}".format(content) for content in examples["subject"]]
-    new_content = ["<commit_after>{}".format(content) for content in examples["new_contents"]]
+    if "old_contents" in examples:
+        old_content = ["<commit_before>{}".format(content) for content in examples["old_contents"]]
+        commit_message = ["<commit_msg>{}".format(content) for content in examples["subject"]]
+        new_content = ["<commit_after>{}".format(content) for content in examples["new_contents"]]
+    else:
+        inputs = examples["content"]
+        old_content = [inp[:inp.index("<commit_msg>")] for inp in inputs]
+        commit_message = [inp[inp.index("<commit_msg>"):inp.index("<commit_after>")] for inp in inputs]
+        new_content = [inp[inp.index("<commit_after>"):] for inp in inputs]
+
     inputs = [old_example + commit_example + new_example
               for old_example, commit_example, new_example in
               zip(old_content, commit_message, new_content)]
@@ -105,7 +114,7 @@ def create_datasets(args):
         num_proc=args.num_workers if not args.streaming else None,
         streaming=args.streaming,
         cache_dir=args.cache_dir,
-        data_files="data/python/python-0001.jsonl",
+        # data_files="data/python/python-0001.jsonl",
     )
 
     dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
@@ -135,6 +144,15 @@ def create_datasets(args):
     )
 
     return train_dataset, valid_dataset
+
+
+class EvaluateDebugCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, logs=None, **kwargs):
+        if state.is_local_process_zero:
+            # evaluate the model
+            model = kwargs["model"]
+            torch.cuda.empty_cache()
+            print("hahaha")
 
 
 def run_training(args, train_data, val_data):
@@ -177,26 +195,6 @@ def run_training(args, train_data, val_data):
         pad_to_multiple_of=8 if training_args.fp16 else None,
     )
 
-    metric = load_metric("bleu")
-
-    def postprocess_text(preds, labels):
-        preds = [pred.strip() for pred in preds]
-        labels = [label.strip() for label in labels]
-        return preds, labels
-
-    def compute_metrics(eval_preds):
-        preds, labels = eval_preds
-        print(preds.shape)
-        if isinstance(preds, tuple):
-            preds = preds[0]
-
-        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-        # Some simple post-processing
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels)
-        return result
-
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -204,7 +202,7 @@ def run_training(args, train_data, val_data):
         eval_dataset=val_data,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics if args.predict_with_generate else None
+        # callbacks=[EvaluateDebugCallback()]
     )
 
     print("Training...")
