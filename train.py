@@ -5,7 +5,7 @@ Fine-Tune SantaCoder on Github commits diff dataset
 import argparse
 import os
 from functools import partial
-
+from datasets import concatenate_datasets
 import torch.cuda
 from datasets import load_dataset
 from datasets import load_metric
@@ -58,6 +58,7 @@ def get_args():
     parser.add_argument("--save_freq", default=1000, type=int)
     parser.add_argument("--predict_with_generate", action="store_true")
     parser.add_argument("--compute_loss_on_input", default=False, action="store_true")
+    parser.add_argument("--flan_file_path", type=str, default=None)
     return parser.parse_args()
 
 
@@ -67,37 +68,51 @@ tokenizer.sep_token = tokenizer.eos_token
 
 
 def preprocess_function(examples, args):
-    if "old_contents" in examples:
-        old_content = ["<commit_before>{}".format(content) for content in examples["old_contents"]]
-        commit_message = ["<commit_msg>{}".format(content) for content in examples["subject"]]
-        new_content = ["<commit_after>{}".format(content) for content in examples["new_contents"]]
+    if args.flan_file_path is not None:
+        input_template = "Instructions: {instruction}\nInput: {input} Output: "
     else:
-        inputs = examples["content"]
-        old_content = [inp[:inp.index("<commit_msg>")] for inp in inputs]
-        commit_message = [inp[inp.index("<commit_msg>"):inp.index("<commit_after>")] for inp in inputs]
-        new_content = [inp[inp.index("<commit_after>"):] for inp in inputs]
+        input_template = "<commit_before>{input}<commit_msg>{instruction}<commit_after>"
+    # the example is from our dataset
+    if "old_contents" in examples:
+        # prefix part should be disabled in loss computation
+        prefix = [input_template.format(input=content,
+                                        instruction=message) for content, message in
+                  zip(examples["old_contents"], examples["subject"])]
+        targets = examples["new_contents"]
+        model_inputs = [prefix_example + target_example for prefix_example, target_example in
+                        zip(prefix, targets)]
+    # the example is from our old dataset
+    elif "content" in examples:
+        # prefix part should be disabled in loss computation
+        model_inputs = examples["content"]
+        # 14 is the character length of "<commit_after>"
+        prefix = [inp[:inp.index("<commit_after>") + 14] for inp in model_inputs]
+        targets = [inp[inp.index("<commit_after>") + 14:] for inp in model_inputs]
+    # the example is from FLAN
+    elif "input" in examples:
+        prefix = examples["input"]
+        targets = examples["output"]
+        model_inputs = [prefix_example + target_example for prefix_example, target_example in
+                        zip(prefix, targets)]
+    else:
+        raise ValueError("Unknown input format")
 
-    inputs = [old_example + commit_example + new_example
-              for old_example, commit_example, new_example in
-              zip(old_content, commit_message, new_content)]
-    model_inputs = tokenizer(inputs,
+    model_inputs = tokenizer(model_inputs,
                              max_length=args.max_input_length,
                              padding="max_length",
                              truncation=True)
     if args.compute_loss_on_input:
+        # since we are computing loss on input, we directly copy it as the label
         model_inputs["labels"] = model_inputs["input_ids"].copy()
     else:
-        old_plus_message = [old_example + commit_example
-                            for old_example, commit_example in
-                            zip(old_content, commit_message)]
-        old_plus_message_ids = tokenizer(old_plus_message,
-                                         max_length=args.max_input_length,
-                                         padding=False,
-                                         truncation=True)["input_ids"]
+        prefix_ids = tokenizer(prefix,
+                               max_length=args.max_input_length,
+                               padding=False,
+                               truncation=True)["input_ids"]
         # -100 means this part of input will not be used in loss computation
-        old_plus_message_prefix = ["".join([tokenizer.eos_token] * len(ids)) for ids in old_plus_message_ids]
-        model_targets = [pad_prefix + new_example for pad_prefix, new_example in
-                         zip(old_plus_message_prefix, new_content)]
+        prefix_str = ["".join([tokenizer.eos_token] * len(ids)) for ids in prefix_ids]
+        model_targets = [pad_prefix + tgt_example for pad_prefix, tgt_example in
+                         zip(prefix_str, targets)]
         labels = tokenizer(model_targets, max_length=args.max_input_length, padding="max_length", truncation=True)
         labels["input_ids"] = [[-100 if l_tok == tokenizer.eos_token_id else l_tok
                                 for l_tok in label] for label in labels["input_ids"]]
@@ -120,6 +135,17 @@ def create_datasets(args):
     dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
     train_data = dataset["train"]
     valid_data = dataset["test"]
+    # if the flan file path is not None, add them into the current train set
+    if args.flan_file_path is not None:
+        flan_dataset = load_dataset(
+            "json",
+            data_files=args.flan_file_path,
+            use_auth_token=True,
+            num_proc=args.num_workers if not args.streaming else None,
+            streaming=args.streaming,
+            cache_dir=args.cache_dir,
+        )
+        train_data = concatenate_datasets([train_data, flan_dataset["train"]])
     # shuffle dataset
     train_data = train_data.shuffle(seed=args.seed)
     print(
