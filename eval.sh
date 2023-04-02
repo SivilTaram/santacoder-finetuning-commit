@@ -16,15 +16,40 @@ for checkpoint_dir in $MODEL_DIR/checkpoint-*; do
 
   accelerate launch --config_file ../eval_config.yaml main.py \
   --model $checkpoint_dir \
-  --tasks parity \
-  --temperature 0.7 \
-  --do_sample True \
-  --n_samples 3200 \
-  --batch_size 160 \
-  --allow_code_execution \
+  --tasks humaneval-x-bugs-python \
+  --do_sample False \
+  --n_samples 1 \
+  --batch_size 1 \
   --save_generations \
   --trust_remote_code \
   --mutate_method edit \
-  --generations_path $checkpoint_dir/generations_parity_temp07.json \
-  --output_path $checkpoint_dir/evaluation_results_parity_temp07.json
+  --generations_path $checkpoint_dir/generations_humanevalxbugspy_greedy.json \
+  --generation_only \
+  --max_length_generation 1024
+
+  accelerate launch --config_file ../eval_config.yaml main.py \
+  --model $checkpoint_dir \
+  --tasks humaneval-x-bugs-js \
+  --do_sample False \
+  --n_samples 1 \
+  --batch_size 1 \
+  --save_generations \
+  --trust_remote_code \
+  --mutate_method edit \
+  --generations_path $checkpoint_dir/generations_humanevalxbugsjs_greedy.json \
+  --generation_only \
+  --max_length_generation 1024
+
+  accelerate launch --config_file ../eval_config.yaml main.py \
+  --model $checkpoint_dir \
+  --tasks humaneval-x-bugs-java \
+  --do_sample False \
+  --n_samples 1 \
+  --batch_size 1 \
+  --save_generations \
+  --trust_remote_code \
+  --mutate_method edit \
+  --generations_path $checkpoint_dir/generations_humanevalxbugsjava_greedy.json \
+  --generation_only \
+  --max_length_generation 1024
 done
