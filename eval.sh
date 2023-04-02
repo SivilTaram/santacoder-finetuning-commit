@@ -8,10 +8,15 @@ cd evaluation
 SANTACODER_DIR=/dev/cache/qian/checkpoints/santacoder
 export HF_MODULES_CACHE=$SANTACODER_DIR
 export PYTHONPATH=$PYTHONPATH:$SANTACODER_DIR
-MODEL_DIR=/dev/cache/qian/checkpoints/santacoder_v9_100k_instruction_strict_filter
+MODEL_DIR=/dev/cache/qian/checkpoints/santacoder_v9_100k_instruction_strict_filter_with_input_loss
 
 # traverse all checkpoints
 for checkpoint_dir in $MODEL_DIR/checkpoint-*; do
+  cp $SANTACODER_DIR/config.json $checkpoint_dir/config.json
+  cp $SANTACODER_DIR/configuration_gpt2_mq.py $checkpoint_dir/configuration_gpt2_mq.py
+  cp $SANTACODER_DIR/modeling_gpt2_mq.py $checkpoint_dir/modeling_gpt2_mq.py
+  cp $SANTACODER_DIR/tokenizer.json $checkpoint_dir/tokenizer.json
+  cp $SANTACODER_DIR/tokenizer_config.json $checkpoint_dir/tokenizer_config.json
   echo "Evaluating checkpoint: $checkpoint_dir"
 
   accelerate launch --config_file ../eval_config.yaml main.py \
