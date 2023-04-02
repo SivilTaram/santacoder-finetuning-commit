@@ -1,0 +1,4 @@
+[submodule "evaluation"]
+	path = evaluation
+	url = https://github.com/bigcode-project/bigcode-evaluation-harness.git
+	branch = parity
