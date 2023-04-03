@@ -58,6 +58,8 @@ def get_args():
     parser.add_argument("--save_freq", default=1000, type=int)
     parser.add_argument("--predict_with_generate", action="store_true")
     parser.add_argument("--compute_loss_on_input", default=False, action="store_true")
+    parser.add_argument("--compute_loss_on_instruction", default=False, action="store_true")
+    parser.add_argument("--data_packing", default=False, action="store_true")
     parser.add_argument("--flan_file_path", type=str, default=None)
     return parser.parse_args()
 
@@ -78,9 +80,17 @@ def preprocess_function(examples, args):
                              padding="max_length",
                              truncation=True)
     if args.compute_loss_on_input:
+        assert args.compute_loss_on_instruction is False
         # since we are computing loss on input, we directly copy it as the label
         model_inputs["labels"] = model_inputs["input_ids"].copy()
     else:
+        if args.compute_loss_on_instruction:
+            # TODO: the current implementation is somewhat tricky.
+            assert "<commit_msg>" in examples["input"][0]
+            targets = [inp_example[inp_example.index("<commit_msg>"):] +
+                       tgt_example for inp_example, tgt_example in zip(inputs, targets)]
+            inputs = [inp_example[:inp_example.index("<commit_msg>")] for inp_example in inputs]
+
         input_ids = tokenizer(inputs,
                               max_length=args.max_input_length,
                               padding=False,
@@ -104,11 +114,10 @@ def create_datasets(args):
         use_auth_token=True,
         num_proc=args.num_workers if not args.streaming else None,
         streaming=args.streaming,
-        cache_dir=args.cache_dir,
-        # data_files="data/python/python-0001.jsonl",
+        cache_dir=args.cache_dir
     )
 
-    dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
+    # dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
 
     def unify_format(examples):
         if args.flan_file_path is not None:
@@ -120,6 +129,12 @@ def create_datasets(args):
             # 14 is the character length of "<commit_after>"
             inputs = [inp[:inp.index("<commit_after>") + 14] for inp in examples["content"]]
             targets = [inp[inp.index("<commit_after>") + 14:] for inp in examples["content"]]
+        # the example if from the diff dataset
+        elif "diff" in examples:
+            inputs = [input_template.format(input=content,
+                                            instruction=message) for content, message in
+                      zip(examples["old_contents"], examples["subject"])]
+            targets = examples["diff"]
         # the example is from our new dataset
         else:
             inputs = [input_template.format(input=content,
