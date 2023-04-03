@@ -68,42 +68,37 @@ tokenizer = AutoTokenizer.from_pretrained("bigcode/santacoder")
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.sep_token = tokenizer.eos_token
 
-
 def preprocess_function(examples, args):
-    # the example is from FLAN
     inputs = examples["input"]
     targets = examples["output"]
-    model_inputs = [prefix_example + target_example for prefix_example, target_example in
-                    zip(inputs, targets)]
-    model_inputs = tokenizer(model_inputs,
-                             max_length=args.max_input_length,
-                             padding="max_length",
-                             truncation=True)
+
+    model_inputs = tokenizer(
+        [inp + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)], 
+        max_length=args.max_input_length, padding="max_length", truncation=True
+    )
+    
+    # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
+    first_eos_indices = [
+        model_inputs["input_ids"][i].index(tokenizer.eos_token_id) 
+        if model_inputs["input_ids"][i][-1] == tokenizer.eos_token_id else args.max_input_length
+        for i in range(len(model_inputs["input_ids"]))
+    ]
+
     if args.compute_loss_on_input:
         assert args.compute_loss_on_instruction is False
-        # since we are computing loss on input, we directly copy it as the label
-        model_inputs["labels"] = model_inputs["input_ids"].copy()
+        model_inputs["labels"] = [
+            inp[:first_eos_indices[i] + 1] + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
+            for i, inp in enumerate(model_inputs["input_ids"])
+        ]
     else:
-        if args.compute_loss_on_instruction:
-            # TODO: the current implementation is somewhat tricky.
-            assert "<commit_msg>" in examples["input"][0]
-            targets = [inp_example[inp_example.index("<commit_msg>"):] +
-                       tgt_example for inp_example, tgt_example in zip(inputs, targets)]
-            inputs = [inp_example[:inp_example.index("<commit_msg>")] for inp_example in inputs]
-
-        input_ids = tokenizer(inputs,
-                              max_length=args.max_input_length,
-                              padding=False,
-                              truncation=True)["input_ids"]
-        # -100 means this part of input will not be used in loss computation
-        input_str = ["".join([tokenizer.eos_token] * len(ids)) for ids in input_ids]
-        model_targets = [inp_example + tgt_example for inp_example, tgt_example in
-                         zip(input_str, targets)]
-        labels = tokenizer(model_targets, max_length=args.max_input_length, padding="max_length", truncation=True)
-        labels["input_ids"] = [[-100 if l_tok == tokenizer.eos_token_id else l_tok
-                                for l_tok in label] for label in labels["input_ids"]]
-        model_inputs["labels"] = labels["input_ids"]
-
+        inputs = tokenizer(
+            inputs, max_length=args.max_input_length, padding=False, truncation=True
+        )["input_ids"]
+        # -100 means ignore in loss computation; Make sure only one final eos token is predicted
+        model_inputs["labels"] = [
+            [-100] * len(inp) + inp_target[len(inp):first_eos_indices[i] + 1] + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
+            for i, (inp, inp_target) in enumerate(zip(inputs, model_inputs["input_ids"]))
+        ]
     return model_inputs
 
 
@@ -122,8 +117,11 @@ def create_datasets(args):
     def unify_format(examples):
         if args.flan_file_path is not None:
             input_template = "Instructions: {instruction}\nInput: {input} Output: "
+        elif args.compute_loss_on_instruction:
+            input_template = "<commit_before>{input}<commit_msg>"
         else:
             input_template = "<commit_before>{input}<commit_msg>{instruction}<commit_after>"
+        
         # the example is from our old dataset
         if "content" in examples:
             # 14 is the character length of "<commit_after>"
@@ -131,20 +129,35 @@ def create_datasets(args):
             targets = [inp[inp.index("<commit_after>") + 14:] for inp in examples["content"]]
         # the example if from the diff dataset
         elif "diff" in examples:
-            inputs = [input_template.format(input=content,
-                                            instruction=message) for content, message in
-                      zip(examples["old_contents"], examples["subject"])]
-            targets = examples["diff"]
+            if args.compute_loss_on_instruction:
+                inputs = [
+                    input_template.format(input=content) 
+                    for content in examples["old_contents"]
+                ]
+                targets = examples["subject"] + "<commit_after>" + examples["diff"]
+            else:
+                inputs = [
+                    input_template.format(input=content, instruction=message) 
+                    for content, message in zip(examples["old_contents"], examples["subject"])
+                ]
+                targets = examples["diff"]
         # the example is from our new dataset
         else:
-            inputs = [input_template.format(input=content,
-                                            instruction=message) for content, message in
-                      zip(examples["old_contents"], examples["subject"])]
-            targets = examples["new_contents"]
+            if args.compute_loss_on_instruction:
+                inputs = [input_template.format(input=content) for content in examples["old_contents"]]
+                targets = examples["subject"] + "<commit_after>" + examples["new_contents"]
+            else:
+                inputs = [
+                    input_template.format(input=content, instruction=message) 
+                    for content, message in zip(examples["old_contents"], examples["subject"])
+                ]
+                targets = examples["new_contents"]
+        
         examples["input"] = inputs
         examples["output"] = targets
         return examples
 
+    
     train_data = dataset["train"].map(unify_format, batched=True, num_proc=args.num_workers)
     valid_data = dataset["test"].map(unify_format, batched=True, num_proc=args.num_workers)
     # if the flan file path is not None, add them into the current train set
