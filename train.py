@@ -73,8 +73,26 @@ def preprocess_function(examples, args):
     # the example is from FLAN
     inputs = examples["input"]
     targets = examples["output"]
-    model_inputs = [prefix_example + target_example for prefix_example, target_example in
-                    zip(inputs, targets)]
+    if args.data_packing:
+        estimate_maximum_char = 4.0 * args.max_input_length
+        packed_inputs, packed_targets, context_len = [], [], 0
+        temp_example = ""
+        for inp_example, tgt_example in zip(inputs, targets):
+            # cannot fit in the current context
+            if context_len + len(inp_example) + len(tgt_example) > estimate_maximum_char:
+                # push the current context
+                packed_inputs.append(temp_example)
+                # refresh the context
+                temp_example = ""
+                context_len = 0
+            temp_example += inp_example + tgt_example + "\n" + tokenizer.eos_token
+            context_len += len(inp_example) + len(tgt_example) + 1
+        if temp_example:
+            packed_inputs.append(temp_example)
+        model_inputs = packed_inputs
+    else:
+        model_inputs = [prefix_example + target_example for prefix_example, target_example in
+                        zip(inputs, targets)]
     model_inputs = tokenizer(model_inputs,
                              max_length=args.max_input_length,
                              padding="max_length",
@@ -117,13 +135,13 @@ def create_datasets(args):
         cache_dir=args.cache_dir
     )
 
-    # dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
+    dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
 
     def unify_format(examples):
         if args.flan_file_path is not None:
             input_template = "Instructions: {instruction}\nInput: {input} Output: "
         else:
-            input_template = "<commit_before>{input}<commit_msg>{instruction}<commit_after>"
+            input_template = "<commit_before>\n{input}\n<commit_msg>\n{instruction}\n<commit_after>\n"
         # the example is from our old dataset
         if "content" in examples:
             # 14 is the character length of "<commit_after>"
@@ -131,19 +149,23 @@ def create_datasets(args):
             targets = [inp[inp.index("<commit_after>") + 14:] for inp in examples["content"]]
         # the example if from the diff dataset
         elif "diff" in examples:
-            inputs = [input_template.format(input=content,
-                                            instruction=message) for content, message in
+            inputs = [input_template.format(input=content.strip(),
+                                            instruction=message.strip()) for content, message in
                       zip(examples["old_contents"], examples["subject"])]
-            targets = examples["diff"]
+            targets = [ex.strip() for ex in examples["diff"]]
         # the example is from our new dataset
         else:
-            inputs = [input_template.format(input=content,
-                                            instruction=message) for content, message in
+            inputs = [input_template.format(input=content.strip(),
+                                            instruction=message.strip()) for content, message in
                       zip(examples["old_contents"], examples["subject"])]
-            targets = examples["new_contents"]
+            targets = [ex.strip() for ex in examples["new_contents"]]
         examples["input"] = inputs
         examples["output"] = targets
         return examples
+
+    if not args.compute_loss_on_input:
+        # TODO: currently we do not support data packing when not computing loss on input
+        assert args.data_packing is False, "data packing can be used when computing loss on input"
 
     train_data = dataset["train"].map(unify_format, batched=True, num_proc=args.num_workers)
     valid_data = dataset["test"].map(unify_format, batched=True, num_proc=args.num_workers)
