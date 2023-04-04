@@ -96,13 +96,12 @@ def preprocess_function(examples, args):
     inputs = examples["input"]
     targets = examples["output"]
     model_inputs = [inp + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)]
-    model_inputs = tokenizer(model_inputs,
-                             max_length=args.max_input_length,
-                             # no padding to calculate the real length
-                             padding=False,
-                             truncation=True)
-
     if args.data_packing:
+        model_inputs = tokenizer(model_inputs,
+                                 max_length=args.max_input_length,
+                                 # no padding to calculate the real length
+                                 padding=False,
+                                 truncation=True)
         # packing in the input_ids level
         max_window = args.max_input_length
         # packed_length maintains a list, each of which is a list of all packed sequence lengths in this sequence
@@ -135,6 +134,11 @@ def preprocess_function(examples, args):
         first_eos_indices = [len(packed_ids[i]) - 1 for i in range(len(packed_ids))]
     else:
         assert tokenizer.eos_token_id == tokenizer.pad_token_id
+        model_inputs = tokenizer(model_inputs,
+                                 max_length=args.max_input_length,
+                                 # no padding to calculate the real length
+                                 padding=True,
+                                 truncation=True)
         # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
         first_eos_indices = [
             model_inputs["input_ids"][i].index(tokenizer.eos_token_id)
