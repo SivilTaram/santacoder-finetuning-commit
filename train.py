@@ -139,7 +139,7 @@ def create_datasets(args):
 
     def unify_format(examples):
         if args.flan_file_path is not None:
-            input_template = "Instructions: {instruction}\nInput: {input} Output: "
+            input_template = "Instructions: {instruction}\nInput:\n{input}\nOutput:\n"
         else:
             input_template = "<commit_before>\n{input}\n<commit_msg>\n{instruction}\n<commit_after>\n"
         # the example is from our old dataset
