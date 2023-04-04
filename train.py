@@ -155,7 +155,10 @@ def create_datasets(args):
                     input_template.format(input=content.strip()) 
                     for content in examples["old_contents"]
                 ]
-                targets = examples["subject"] + "<commit_after>" + examples["diff"]
+                targets = [
+                    sub_example + "<commit_after>" + diff_example
+                    for sub_example, diff_example in zip(examples["subject"], examples["diff"])
+                ]
             else:
                 inputs = [
                     input_template.format(input=content.strip(), instruction=message.strip()) 
@@ -166,7 +169,10 @@ def create_datasets(args):
         else:
             if args.compute_loss_on_instruction:
                 inputs = [input_template.format(input=content.strip()) for content in examples["old_contents"]]
-                targets = examples["subject"] + "<commit_after>" + examples["new_contents"]
+                targets = [
+                    sub_example + "<commit_after>" + new_example
+                    for sub_example, new_example in zip(examples["subject"], examples["new_contents"])
+                ]
             else:
                 inputs = [
                     input_template.format(input=content.strip(), instruction=message.strip()) 
