@@ -92,11 +92,13 @@ def create_flatten_attention_mask(lengths, max_length):
     return attention_mask
 
 
-def preprocess_function(examples, args):
+def preprocess_function(examples, args, is_train):
     inputs = examples["input"]
     targets = examples["output"]
     model_inputs = [inp + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)]
-    if args.data_packing:
+
+    # do not do packing for fair comparison with no packing
+    if args.data_packing and is_train:
         model_inputs = tokenizer(model_inputs,
                                  max_length=args.max_input_length,
                                  # no padding to calculate the real length
@@ -248,9 +250,10 @@ def create_datasets(args):
     print(
         f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}"
     )
+
     column_names = dataset.column_names["train"] + ["input", "output"]
     train_dataset = train_data.map(
-        partial(preprocess_function, args=args),
+        partial(preprocess_function, args=args, is_train=True),
         batched=True,
         num_proc=args.num_workers,
         remove_columns=column_names,
@@ -258,7 +261,7 @@ def create_datasets(args):
         desc="Running tokenizer on train dataset",
     )
     valid_dataset = valid_data.map(
-        partial(preprocess_function, args=args),
+        partial(preprocess_function, args=args, is_train=False),
         batched=True,
         num_proc=args.num_workers,
         remove_columns=column_names,
