@@ -19,6 +19,7 @@ from transformers import (
     set_seed,
     TrainerCallback
 )
+import numpy as np
 
 
 def get_args():
@@ -69,46 +70,82 @@ tokenizer.pad_token = tokenizer.eos_token
 tokenizer.sep_token = tokenizer.eos_token
 
 
+def create_block_diag_attention_mask(lengths, max_length):
+    """
+    Create a block diagonal attention mask, which prevents the example in a packed sequence from seeing others
+    """
+    attention_mask = np.zeros((max_length, max_length), dtype=np.int32)
+    current_idx = 0
+    for length in lengths:
+        attention_mask[current_idx: current_idx + length, current_idx: current_idx + length] = np.tril(np.ones((length, length)))
+        current_idx += length
+    return attention_mask
+
+
+def create_flatten_attention_mask(lengths, max_length):
+    """
+    Create a flatted attention mask which saves more resources
+    """
+    attention_mask = np.zeros(max_length, dtype=np.int32)
+    total_length = sum(lengths)
+    attention_mask[:total_length] = 1
+    return attention_mask
+
+
 def preprocess_function(examples, args):
     inputs = examples["input"]
     targets = examples["output"]
-    if args.data_packing:
-        estimate_maximum_char = 4.0 * args.max_input_length
-        packed_inputs, context_len = [], 0
-        temp_example = ""
-        for inp_example, tgt_example in zip(inputs, targets):
-            # cannot fit in the current context
-            if context_len + len(inp_example) + len(tgt_example) > estimate_maximum_char:
-                # push the current context
-                packed_inputs.append(temp_example)
-                # refresh the context
-                temp_example = ""
-                context_len = 0
-            temp_example += inp_example + tgt_example + tokenizer.eos_token
-            context_len += len(inp_example) + len(tgt_example) + 1
-        if temp_example:
-            packed_inputs.append(temp_example)
-        model_inputs = packed_inputs
-    else:
-        model_inputs = [inp + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)]
-   
+    model_inputs = [inp + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)]
     model_inputs = tokenizer(model_inputs,
                              max_length=args.max_input_length,
-                             padding="max_length",
+                             # no padding to calculate the real length
+                             padding=False,
                              truncation=True)
 
-    assert tokenizer.eos_token_id == tokenizer.pad_token_id
-    # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
-    first_eos_indices = [
-        model_inputs["input_ids"][i].index(tokenizer.eos_token_id) 
-        if model_inputs["input_ids"][i][-1] == tokenizer.eos_token_id else args.max_input_length
-        for i in range(len(model_inputs["input_ids"]))
-    ]
+    if args.data_packing:
+        # packing in the input_ids level
+        max_window = args.max_input_length
+        # packed_length maintains a list, each of which is a list of all packed sequence lengths in this sequence
+        packed_lengths, packed_ids,  = [], []
+        temp_lengths, temp_ids = [], []
+        for input_ids in model_inputs["input_ids"]:
+            if sum(temp_lengths) + len(input_ids) >= max_window:
+                packed_lengths.append(temp_lengths.copy())
+                packed_ids.append(temp_ids.copy())
+                # refresh for the next packed sequence
+                temp_lengths.clear()
+                temp_ids.clear()
+            temp_ids.extend(input_ids)
+            temp_lengths.append(len(input_ids))
+        # add the last one
+        if temp_lengths:
+            packed_lengths.append(temp_lengths.copy())
+            packed_ids.append(temp_ids.copy())
+        # pad the packed_ids into max_window
+        padded_input_ids = np.zeros((len(packed_ids), max_window), dtype=np.int64)
+        padded_attention_masks = np.zeros((len(packed_ids), max_window), dtype=np.int64)
+        for i, example_input_ids in enumerate(packed_ids):
+            padded_input_ids[i, :len(example_input_ids)] = example_input_ids
+            # obtain the attention mask
+            attention_mask = create_flatten_attention_mask(packed_lengths[i], args.max_input_length)
+            padded_attention_masks[i] = attention_mask
+        model_inputs["input_ids"] = padded_input_ids
+        model_inputs["attention_mask"] = padded_attention_masks
+        # take the last valid eos token as the end of the sequence
+        first_eos_indices = [len(packed_ids[i]) - 1 for i in range(len(packed_ids))]
+    else:
+        assert tokenizer.eos_token_id == tokenizer.pad_token_id
+        # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
+        first_eos_indices = [
+            model_inputs["input_ids"][i].index(tokenizer.eos_token_id)
+            if model_inputs["input_ids"][i][-1] == tokenizer.eos_token_id else args.max_input_length
+            for i in range(len(model_inputs["input_ids"]))
+        ]
 
     if args.compute_loss_on_input:
         assert args.compute_loss_on_instruction is False
         model_inputs["labels"] = [
-            inp[:first_eos_indices[i] + 1] + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
+            list(inp[:first_eos_indices[i] + 1]) + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
             for i, inp in enumerate(model_inputs["input_ids"])
         ]
     else:
@@ -117,7 +154,8 @@ def preprocess_function(examples, args):
         )["input_ids"]
         # -100 means ignore in loss computation; Make sure only one final eos token is predicted
         model_inputs["labels"] = [
-            [-100] * len(inp) + inp_target[len(inp):first_eos_indices[i] + 1] + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
+            [-100] * len(inp) + inp_target[len(inp):first_eos_indices[i] + 1] + [-100] * (
+                        args.max_input_length - first_eos_indices[i] - 1)
             for i, (inp, inp_target) in enumerate(zip(inputs, model_inputs["input_ids"]))
         ]
     return model_inputs
@@ -142,7 +180,7 @@ def create_datasets(args):
             input_template = "<commit_before>{input}<commit_msg>"
         else:
             input_template = "<commit_before>\n{input}\n<commit_msg>\n{instruction}\n<commit_after>\n"
-        
+
         # the example is from our old dataset
         if "content" in examples:
             # 14 is the character length of "<commit_after>"
@@ -152,7 +190,7 @@ def create_datasets(args):
         elif "diff" in examples:
             if args.compute_loss_on_instruction:
                 inputs = [
-                    input_template.format(input=content.strip()) 
+                    input_template.format(input=content.strip())
                     for content in examples["old_contents"]
                 ]
                 targets = [
@@ -161,7 +199,7 @@ def create_datasets(args):
                 ]
             else:
                 inputs = [
-                    input_template.format(input=content.strip(), instruction=message.strip()) 
+                    input_template.format(input=content.strip(), instruction=message.strip())
                     for content, message in zip(examples["old_contents"], examples["subject"])
                 ]
                 targets = examples["diff"]
@@ -175,11 +213,11 @@ def create_datasets(args):
                 ]
             else:
                 inputs = [
-                    input_template.format(input=content.strip(), instruction=message.strip()) 
+                    input_template.format(input=content.strip(), instruction=message.strip())
                     for content, message in zip(examples["old_contents"], examples["subject"])
                 ]
                 targets = examples["new_contents"]
-        
+
         examples["input"] = inputs
         examples["output"] = targets
         return examples
