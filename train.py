@@ -7,7 +7,7 @@ import os
 from functools import partial
 from datasets import concatenate_datasets
 import torch.cuda
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from datasets import load_metric
 from transformers import (
     AutoModelForCausalLM,
@@ -17,7 +17,8 @@ from transformers import (
     TrainingArguments,
     logging,
     set_seed,
-    TrainerCallback
+    TrainerCallback,
+    AutoConfig
 )
 import numpy as np
 
@@ -61,7 +62,9 @@ def get_args():
     parser.add_argument("--compute_loss_on_input", default=False, action="store_true")
     parser.add_argument("--compute_loss_on_instruction", default=False, action="store_true")
     parser.add_argument("--data_packing", default=False, action="store_true")
+    parser.add_argument("--add_file_name", default=False, action="store_true")
     parser.add_argument("--flan_file_path", type=str, default=None)
+
     return parser.parse_args()
 
 
@@ -139,7 +142,7 @@ def preprocess_function(examples, args, is_train):
         model_inputs = tokenizer(model_inputs,
                                  max_length=args.max_input_length,
                                  # no padding to calculate the real length
-                                 padding=True,
+                                 padding="max_length",
                                  truncation=True)
         # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
         first_eos_indices = [
@@ -177,13 +180,21 @@ def create_datasets(args):
         cache_dir=args.cache_dir
     )
 
+    # if streaming, we only use a small portion of the dataset for debugging
+    if args.streaming:
+        sample_number = 100
+        train_data = []
+        for i in range(sample_number):
+            train_data.append(next(iter(dataset)))
+        dataset = Dataset.from_list(train_data)
+
     dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
 
     def unify_format(examples):
         if args.flan_file_path is not None:
             input_template = "Instructions: {instruction}\nInput:\n{input}\nOutput:\n"
         elif args.compute_loss_on_instruction:
-            input_template = "<commit_before>{input}<commit_msg>"
+            input_template = "<commit_before>\n{input}\n<commit_msg>"
         else:
             input_template = "<commit_before>\n{input}\n<commit_msg>\n{instruction}\n<commit_after>\n"
 
@@ -200,7 +211,7 @@ def create_datasets(args):
                     for content in examples["old_contents"]
                 ]
                 targets = [
-                    sub_example + "<commit_after>" + diff_example
+                    sub_example + "\n<commit_after>\n" + diff_example
                     for sub_example, diff_example in zip(examples["subject"], examples["diff"])
                 ]
             else:
@@ -223,6 +234,10 @@ def create_datasets(args):
                     for content, message in zip(examples["old_contents"], examples["subject"])
                 ]
                 targets = examples["new_contents"]
+
+        if args.add_file_name:
+            file_names = [file_path.split("/")[-1] for file_path in examples["old_file"]]
+            inputs = [f"<file_name>\n{file_name}\n{inp}" for file_name, inp in zip(file_names, inputs)]
 
         examples["input"] = inputs
         examples["output"] = targets
@@ -287,8 +302,9 @@ def run_training(args, train_data, val_data):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         trust_remote_code=True,
-        use_cache=not args.gradient_checkpointing,
+        use_cache=not args.gradient_checkpointing
     )
+    print("Model loaded")
     train_data.start_iteration = 0
 
     print(f"Starting main loop")
