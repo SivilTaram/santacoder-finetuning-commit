@@ -7,7 +7,7 @@ import os
 from functools import partial
 from datasets import concatenate_datasets
 import torch.cuda
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from datasets import load_metric
 from transformers import (
     AutoModelForCausalLM,
@@ -17,8 +17,11 @@ from transformers import (
     TrainingArguments,
     logging,
     set_seed,
-    TrainerCallback
+    TrainerCallback,
+    AutoConfig
 )
+import numpy as np
+from transformers import AutoModelForSeq2SeqLM
 
 
 def get_args():
@@ -60,7 +63,9 @@ def get_args():
     parser.add_argument("--compute_loss_on_input", default=False, action="store_true")
     parser.add_argument("--compute_loss_on_instruction", default=False, action="store_true")
     parser.add_argument("--data_packing", default=False, action="store_true")
+    parser.add_argument("--add_file_name", default=False, action="store_true")
     parser.add_argument("--flan_file_path", type=str, default=None)
+
     return parser.parse_args()
 
 
@@ -69,46 +74,64 @@ tokenizer.pad_token = tokenizer.eos_token
 tokenizer.sep_token = tokenizer.eos_token
 
 
-def preprocess_function(examples, args):
+def preprocess_function(examples, args, is_train):
     inputs = examples["input"]
     targets = examples["output"]
-    if args.data_packing:
-        estimate_maximum_char = 4.0 * args.max_input_length
-        packed_inputs, context_len = [], 0
-        temp_example = ""
-        for inp_example, tgt_example in zip(inputs, targets):
-            # cannot fit in the current context
-            if context_len + len(inp_example) + len(tgt_example) > estimate_maximum_char:
-                # push the current context
-                packed_inputs.append(temp_example)
-                # refresh the context
-                temp_example = ""
-                context_len = 0
-            temp_example += inp_example + tgt_example + tokenizer.eos_token
-            context_len += len(inp_example) + len(tgt_example) + 1
-        if temp_example:
-            packed_inputs.append(temp_example)
-        model_inputs = packed_inputs
-    else:
-        model_inputs = [inp + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)]
-   
-    model_inputs = tokenizer(model_inputs,
-                             max_length=args.max_input_length,
-                             padding="max_length",
-                             truncation=True)
+    model_inputs = [inp + tar + tokenizer.eos_token for inp, tar in zip(inputs, targets)]
 
-    assert tokenizer.eos_token_id == tokenizer.pad_token_id
-    # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
-    first_eos_indices = [
-        model_inputs["input_ids"][i].index(tokenizer.eos_token_id) 
-        if model_inputs["input_ids"][i][-1] == tokenizer.eos_token_id else args.max_input_length
-        for i in range(len(model_inputs["input_ids"]))
-    ]
+    # do not do packing for fair comparison with no packing
+    if args.data_packing and is_train:
+        model_inputs = tokenizer(model_inputs,
+                                 max_length=args.max_input_length,
+                                 # no padding to calculate the real length
+                                 padding=False,
+                                 truncation=True)
+        # packing in the input_ids level
+        max_window = args.max_input_length
+        # packed_length maintains a list, each of which is a list of all packed sequence lengths in this sequence
+        packed_lengths, packed_ids,  = [], []
+        temp_length, temp_ids = 0, []
+        for input_ids in model_inputs["input_ids"]:
+            if temp_length + len(input_ids) >= max_window:
+                packed_lengths.append(temp_length)
+                packed_ids.append(temp_ids.copy())
+                # refresh for the next packed sequence
+                temp_length = 0
+                temp_ids.clear()
+            temp_ids.extend(input_ids)
+            temp_length += len(input_ids)
+        # add the last one
+        if temp_length > 0:
+            packed_lengths.append(temp_length)
+            packed_ids.append(temp_ids.copy())
+        # pad the packed_ids into max_window
+        padded_input_ids = np.zeros((len(packed_ids), max_window), dtype=np.int64)
+        padded_attention_masks = np.zeros((len(packed_ids), max_window), dtype=np.int64)
+        for i, example_input_ids in enumerate(packed_ids):
+            padded_input_ids[i, :packed_lengths[i]] = example_input_ids
+            # obtain the attention mask
+            padded_attention_masks[i, :packed_lengths[i]] += 1
+        model_inputs["input_ids"] = padded_input_ids
+        model_inputs["attention_mask"] = padded_attention_masks
+        # take the last valid eos token as the end of the sequence
+        first_eos_indices = [packed_lengths[i] - 1 for i in range(len(packed_lengths))]
+    else:
+        assert tokenizer.eos_token_id == tokenizer.pad_token_id
+        model_inputs = tokenizer(model_inputs,
+                                 max_length=args.max_input_length,
+                                 padding="max_length",
+                                 truncation=True)
+        # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
+        first_eos_indices = [
+            model_inputs["input_ids"][i].index(tokenizer.eos_token_id)
+            if model_inputs["input_ids"][i][-1] == tokenizer.eos_token_id else args.max_input_length
+            for i in range(len(model_inputs["input_ids"]))
+        ]
 
     if args.compute_loss_on_input:
         assert args.compute_loss_on_instruction is False
         model_inputs["labels"] = [
-            inp[:first_eos_indices[i] + 1] + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
+            list(inp[:first_eos_indices[i] + 1]) + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
             for i, inp in enumerate(model_inputs["input_ids"])
         ]
     else:
@@ -117,7 +140,8 @@ def preprocess_function(examples, args):
         )["input_ids"]
         # -100 means ignore in loss computation; Make sure only one final eos token is predicted
         model_inputs["labels"] = [
-            [-100] * len(inp) + inp_target[len(inp):first_eos_indices[i] + 1] + [-100] * (args.max_input_length - first_eos_indices[i] - 1)
+            [-100] * len(inp) + inp_target[len(inp):first_eos_indices[i] + 1] + [-100] * (
+                        args.max_input_length - first_eos_indices[i] - 1)
             for i, (inp, inp_target) in enumerate(zip(inputs, model_inputs["input_ids"]))
         ]
     return model_inputs
@@ -133,16 +157,24 @@ def create_datasets(args):
         cache_dir=args.cache_dir
     )
 
+    # if streaming, we only use a small portion of the dataset for debugging
+    if args.streaming:
+        sample_number = 100
+        train_data = []
+        for i in range(sample_number):
+            train_data.append(next(iter(dataset)))
+        dataset = Dataset.from_list(train_data)
+
     dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
 
     def unify_format(examples):
         if args.flan_file_path is not None:
             input_template = "Instructions: {instruction}\nInput:\n{input}\nOutput:\n"
         elif args.compute_loss_on_instruction:
-            input_template = "<commit_before>{input}<commit_msg>"
+            input_template = "<commit_before>\n{input}\n<commit_msg>"
         else:
             input_template = "<commit_before>\n{input}\n<commit_msg>\n{instruction}\n<commit_after>\n"
-        
+
         # the example is from our old dataset
         if "content" in examples:
             # 14 is the character length of "<commit_after>"
@@ -152,16 +184,16 @@ def create_datasets(args):
         elif "diff" in examples:
             if args.compute_loss_on_instruction:
                 inputs = [
-                    input_template.format(input=content.strip()) 
+                    input_template.format(input=content.strip())
                     for content in examples["old_contents"]
                 ]
                 targets = [
-                    sub_example + "<commit_after>" + diff_example
+                    sub_example + "\n<commit_after>\n" + diff_example
                     for sub_example, diff_example in zip(examples["subject"], examples["diff"])
                 ]
             else:
                 inputs = [
-                    input_template.format(input=content.strip(), instruction=message.strip()) 
+                    input_template.format(input=content.strip(), instruction=message.strip())
                     for content, message in zip(examples["old_contents"], examples["subject"])
                 ]
                 targets = examples["diff"]
@@ -175,11 +207,15 @@ def create_datasets(args):
                 ]
             else:
                 inputs = [
-                    input_template.format(input=content.strip(), instruction=message.strip()) 
+                    input_template.format(input=content.strip(), instruction=message.strip())
                     for content, message in zip(examples["old_contents"], examples["subject"])
                 ]
                 targets = examples["new_contents"]
-        
+
+        if args.add_file_name:
+            file_names = [file_path.split("/")[-1] for file_path in examples["old_file"]]
+            inputs = [f"<file_name>\n{file_name}\n{inp}" for file_name, inp in zip(file_names, inputs)]
+
         examples["input"] = inputs
         examples["output"] = targets
         return examples
@@ -206,9 +242,10 @@ def create_datasets(args):
     print(
         f"Size of the train set: {len(train_data)}. Size of the validation set: {len(valid_data)}"
     )
+
     column_names = dataset.column_names["train"] + ["input", "output"]
     train_dataset = train_data.map(
-        partial(preprocess_function, args=args),
+        partial(preprocess_function, args=args, is_train=True),
         batched=True,
         num_proc=args.num_workers,
         remove_columns=column_names,
@@ -216,7 +253,7 @@ def create_datasets(args):
         desc="Running tokenizer on train dataset",
     )
     valid_dataset = valid_data.map(
-        partial(preprocess_function, args=args),
+        partial(preprocess_function, args=args, is_train=False),
         batched=True,
         num_proc=args.num_workers,
         remove_columns=column_names,
@@ -242,8 +279,10 @@ def run_training(args, train_data, val_data):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         trust_remote_code=True,
-        use_cache=not args.gradient_checkpointing,
+        use_cache=not args.gradient_checkpointing
     )
+
+    print("Model loaded")
     train_data.start_iteration = 0
 
     print(f"Starting main loop")
