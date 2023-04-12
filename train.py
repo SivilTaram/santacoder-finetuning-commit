@@ -21,6 +21,7 @@ from transformers import (
     AutoConfig
 )
 import numpy as np
+from transformers import AutoModelForSeq2SeqLM
 
 
 def get_args():
@@ -73,28 +74,6 @@ tokenizer.pad_token = tokenizer.eos_token
 tokenizer.sep_token = tokenizer.eos_token
 
 
-def create_block_diag_attention_mask(lengths, max_length):
-    """
-    Create a block diagonal attention mask, which prevents the example in a packed sequence from seeing others
-    """
-    attention_mask = np.zeros((max_length, max_length), dtype=np.int32)
-    current_idx = 0
-    for length in lengths:
-        attention_mask[current_idx: current_idx + length, current_idx: current_idx + length] = np.tril(np.ones((length, length)))
-        current_idx += length
-    return attention_mask
-
-
-def create_flatten_attention_mask(lengths, max_length):
-    """
-    Create a flatted attention mask which saves more resources
-    """
-    attention_mask = np.zeros(max_length, dtype=np.int32)
-    total_length = sum(lengths)
-    attention_mask[:total_length] = 1
-    return attention_mask
-
-
 def preprocess_function(examples, args, is_train):
     inputs = examples["input"]
     targets = examples["output"]
@@ -111,32 +90,31 @@ def preprocess_function(examples, args, is_train):
         max_window = args.max_input_length
         # packed_length maintains a list, each of which is a list of all packed sequence lengths in this sequence
         packed_lengths, packed_ids,  = [], []
-        temp_lengths, temp_ids = [], []
+        temp_length, temp_ids = 0, []
         for input_ids in model_inputs["input_ids"]:
-            if sum(temp_lengths) + len(input_ids) >= max_window:
-                packed_lengths.append(temp_lengths.copy())
+            if temp_length + len(input_ids) >= max_window:
+                packed_lengths.append(temp_length)
                 packed_ids.append(temp_ids.copy())
                 # refresh for the next packed sequence
-                temp_lengths.clear()
+                temp_length = 0
                 temp_ids.clear()
             temp_ids.extend(input_ids)
-            temp_lengths.append(len(input_ids))
+            temp_length += len(input_ids)
         # add the last one
-        if temp_lengths:
-            packed_lengths.append(temp_lengths.copy())
+        if temp_length > 0:
+            packed_lengths.append(temp_length)
             packed_ids.append(temp_ids.copy())
         # pad the packed_ids into max_window
         padded_input_ids = np.zeros((len(packed_ids), max_window), dtype=np.int64)
         padded_attention_masks = np.zeros((len(packed_ids), max_window), dtype=np.int64)
         for i, example_input_ids in enumerate(packed_ids):
-            padded_input_ids[i, :len(example_input_ids)] = example_input_ids
+            padded_input_ids[i, :packed_lengths[i]] = example_input_ids
             # obtain the attention mask
-            attention_mask = create_flatten_attention_mask(packed_lengths[i], args.max_input_length)
-            padded_attention_masks[i] = attention_mask
+            padded_attention_masks[i, :packed_lengths[i]] += 1
         model_inputs["input_ids"] = padded_input_ids
         model_inputs["attention_mask"] = padded_attention_masks
         # take the last valid eos token as the end of the sequence
-        first_eos_indices = [len(packed_ids[i]) - 1 for i in range(len(packed_ids))]
+        first_eos_indices = [packed_lengths[i] - 1 for i in range(len(packed_lengths))]
     else:
         assert tokenizer.eos_token_id == tokenizer.pad_token_id
         model_inputs = tokenizer(model_inputs,
@@ -304,6 +282,7 @@ def run_training(args, train_data, val_data):
         trust_remote_code=True,
         use_cache=not args.gradient_checkpointing
     )
+
     print("Model loaded")
     train_data.start_iteration = 0
 
