@@ -119,7 +119,6 @@ def preprocess_function(examples, args, is_train):
         assert tokenizer.eos_token_id == tokenizer.pad_token_id
         model_inputs = tokenizer(model_inputs,
                                  max_length=args.max_input_length,
-                                 # no padding to calculate the real length
                                  padding="max_length",
                                  truncation=True)
         # This relies on tokenizer.eos_token_id == tokenizer.pad_token_id
