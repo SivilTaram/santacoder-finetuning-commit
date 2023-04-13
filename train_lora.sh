@@ -7,7 +7,7 @@ export OMP_NUM_THREADS=1
 
 accelerate launch --config_file config.yaml train.py \
       --max_input_length 2048 \
-      --dataset_name SivilTaram/instruction-commits-strict-filter \
+      --dataset_name bigcode/commits-pjj-2048 \
       --max_steps 100000 \
       --batch_size 2 \
       --gradient_accumulation_steps 4 \
@@ -18,9 +18,9 @@ accelerate launch --config_file config.yaml train.py \
       --log_freq 10 \
       --num_workers 8 \
       --bf16 \
+      --deepspeed zero_stage1_config.json \
       --cache_dir /dev/cache_sail/liuqian/datasets \
       --compute_loss_on_input \
       --data_packing \
       --enable_lora \
-      --streaming \
       --output_dir /dev/cache/qian/checkpoints/santacoder_v10_instruction_verb_filter_2048_lora
