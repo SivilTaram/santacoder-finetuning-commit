@@ -22,6 +22,7 @@ from transformers import (
 )
 import numpy as np
 from transformers import AutoModelForSeq2SeqLM
+from peft import LoraConfig, TaskType, get_peft_model
 
 
 def get_args():
@@ -65,6 +66,7 @@ def get_args():
     parser.add_argument("--data_packing", default=False, action="store_true")
     parser.add_argument("--add_file_name", default=False, action="store_true")
     parser.add_argument("--flan_file_path", type=str, default=None)
+    parser.add_argument("--enable_lora", default=False, action="store_true")
 
     return parser.parse_args()
 
@@ -89,7 +91,7 @@ def preprocess_function(examples, args, is_train):
         # packing in the input_ids level
         max_window = args.max_input_length
         # packed_length maintains a list, each of which is a list of all packed sequence lengths in this sequence
-        packed_lengths, packed_ids,  = [], []
+        packed_lengths, packed_ids, = [], []
         temp_length, temp_ids = 0, []
         for input_ids in model_inputs["input_ids"]:
             if temp_length + len(input_ids) >= max_window:
@@ -141,7 +143,7 @@ def preprocess_function(examples, args, is_train):
         # -100 means ignore in loss computation; Make sure only one final eos token is predicted
         model_inputs["labels"] = [
             [-100] * len(inp) + inp_target[len(inp):first_eos_indices[i] + 1] + [-100] * (
-                        args.max_input_length - first_eos_indices[i] - 1)
+                    args.max_input_length - first_eos_indices[i] - 1)
             for i, (inp, inp_target) in enumerate(zip(inputs, model_inputs["input_ids"]))
         ]
     return model_inputs
@@ -264,15 +266,6 @@ def create_datasets(args):
     return train_dataset, valid_dataset
 
 
-class EvaluateDebugCallback(TrainerCallback):
-    def on_step_end(self, args, state, control, logs=None, **kwargs):
-        if state.is_local_process_zero:
-            # evaluate the model
-            model = kwargs["model"]
-            torch.cuda.empty_cache()
-            print("hahaha")
-
-
 def run_training(args, train_data, val_data):
     print("Loading the model")
     # disable caching mechanism when using gradient checkpointing
@@ -281,6 +274,17 @@ def run_training(args, train_data, val_data):
         trust_remote_code=True,
         use_cache=not args.gradient_checkpointing
     )
+
+    if args.enable_lora:
+        config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=8,
+            lora_alpha=32,
+            target_modules=["q_attn", "kv_attn"],
+            lora_dropout=0.1)
+        model = get_peft_model(model, config)
+        model.print_trainable_parameters()
 
     print("Model loaded")
     train_data.start_iteration = 0
