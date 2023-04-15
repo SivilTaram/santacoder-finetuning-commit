@@ -22,7 +22,7 @@ from transformers import (
 )
 import numpy as np
 from transformers import AutoModelForSeq2SeqLM
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_int8_training
 
 
 def get_args():
@@ -161,7 +161,7 @@ def create_datasets(args):
 
     # if streaming, we only use a small portion of the dataset for debugging
     if args.streaming:
-        sample_number = 100
+        sample_number = 480
         train_data = []
         for i in range(sample_number):
             train_data.append(next(iter(dataset)))
@@ -276,13 +276,21 @@ def run_training(args, train_data, val_data):
     )
 
     if args.enable_lora:
+        if args.model_path == "bigcode/large-model":
+            target_modules = ["c_attn", "q_attn"]
+        else:
+            target_modules = ["kv_attn", "q_attn"]
         config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             inference_mode=False,
             r=8,
             lora_alpha=32,
-            target_modules=["q_attn", "kv_attn"],
+            bias="none",
+            target_modules=target_modules,
             lora_dropout=0.1)
+        # prepare 8-int model for training
+        if args.model_path == "bigcode/large-model":
+            model = prepare_model_for_int8_training(model)
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
 
