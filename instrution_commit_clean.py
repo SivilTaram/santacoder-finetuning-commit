@@ -1,3 +1,4 @@
+import json
 import random
 import re
 from collections import Counter
@@ -8,20 +9,28 @@ import numpy as np
 from datasets import load_dataset, concatenate_datasets
 from huggingface_hub import hf_hub_download
 
+# WARNING: please remember to add all hyperparameters to the dataset description
 CACHE_DIR = "/dev/cache/qian/datasets/instruction-commits"
 DATASET_NAME = "bigcode/instruction-commits"
-PUSH_DATASET_NAME = "SivilTaram/instruction-commits-high-sampling"
+PUSH_DATASET_NAME = "SivilTaram/instruction-commits-soft-filter"
 
 # 1.0 mean keep all short commit messages
 SHORT_SAMPLING = 0.2
+LONG_SAMPLING_THRESHOLD = 500
 LONG_SAMPLING = 0.1
 MD_SAMPLING = 1.0
+
 DATA_SAMPLING = 1.0
 
-# repeat time of the whole dataset
-SAMPLE_TIME = 3
-PROBA_THRESHOLD = 0.1
-LOW_QUALITY_SAMPLING = 0.1
+PROBA_STRICT_FILTERING = False
+STRICT_PROBA_THRESHOLD = 0.01
+
+# if enable resampling, it means you want to resample the dataset according to the probability of the
+# commit message being instructions
+PROBA_SOFT_RESAMPLING = True
+SAMPLE_REPEAT_TIMES = 3
+SOFT_PROBA_THRESHOLD = 0.1
+LOW_QUALITY_SAMPLING_PROB = 0.1
 
 # the ratio to control how many examples are fully shown in the model input, 0.2 means 20% examples will have
 # the full code context such as the whole code file as the input
@@ -30,7 +39,28 @@ FULL_RANGE_FRAC = 0.2
 MIN_RANGE = 0
 MAX_RANGE = 32
 
-# the
+assert not (PROBA_STRICT_FILTERING and PROBA_SOFT_RESAMPLING), "You can only enable one of the two options: ENABLE_PROBA_FILTERING and ENABLE_RESAMPLING"
+
+dataset_description = "This dataset is built with the following parameters: \n" \
+                        f"The sampling parameters to balance the code modification range as:\n" \
+                        f"  SHORT_SAMPLING: {SHORT_SAMPLING}\n" \
+                        f"  LONG_SAMPLING: {LONG_SAMPLING}\n" \
+                        f"  LONG_SAMPLING_THRESHOLD: {LONG_SAMPLING_THRESHOLD}\n" \
+                        f"  MD_SAMPLING: {MD_SAMPLING}\n" \
+                        f"The sampling parameters to balance the programming language as:\n" \
+                        f"  DATA_SAMPLING: {DATA_SAMPLING}\n" \
+                        f"The sampling parameters to strictly filter the dataset using it's proba of being a good instruction as:\n" \
+                        f"  PROBA_STRICT_FILTERING: {PROBA_STRICT_FILTERING}\n" \
+                        f"  STRICT_PROBA_THRESHOLD: {STRICT_PROBA_THRESHOLD}\n" \
+                        f"The sampling parameters to resample the dataset using it's proba of being a good instruction as:\n" \
+                        f"  PROBA_SOFT_RESAMPLING: {PROBA_SOFT_RESAMPLING}\n" \
+                        f"  SOFT_PROBA_THRESHOLD: {SOFT_PROBA_THRESHOLD}\n" \
+                        f"  SAMPLE_REPEAT_TIMES: {SAMPLE_REPEAT_TIMES}\n" \
+                        f"  LOW_QUALITY_SAMPLING_PROB: {LOW_QUALITY_SAMPLING_PROB}\n" \
+                        f"The sampling parameters to control the code context range as:\n" \
+                        f"  FULL_RANGE_FRAC: {FULL_RANGE_FRAC}\n" \
+                        f"  MIN_RANGE: {MIN_RANGE}\n" \
+                        f"  MAX_RANGE: {MAX_RANGE}\n"
 
 DATA_EXT = {"json", "yml", "xml", "html"}
 
@@ -171,23 +201,10 @@ ds = concatenate_datasets(ds_list)
 
 print("The dataset size is: {}".format(len(ds)))
 
+if PROBA_STRICT_FILTERING:
+    ds = ds.filter(lambda x: x["proba"] >= STRICT_PROBA_THRESHOLD, num_proc=30)
+    print("After proba strict filtering, the dataset size is {}".format(len(ds)))
 
-# repeat the dataset to make it larger
-ds = concatenate_datasets([ds] * SAMPLE_TIME)
-
-
-def sub_sampling_based_on_proba(example):
-    proba = example["proba"]
-    if proba > PROBA_THRESHOLD:
-        return True
-    elif random.random() < LOW_QUALITY_SAMPLING:
-        return True
-    return False
-
-
-# ds = ds.filter(lambda x: x["proba"] >= 0.9, num_proc=30)
-
-print("After proba filtering, the dataset size is: {}".format(len(ds)))
 
 ds = ds.filter(lambda x: len(x["old_contents"]) < 100_000, num_proc=30)
 
@@ -204,7 +221,7 @@ def commit_filter(example):
         if random.random() > SHORT_SAMPLING:
             return False
 
-    if example["old_change_range"] >= 200:
+    if example["old_change_range"] >= LONG_SAMPLING_THRESHOLD:
         if random.random() > LONG_SAMPLING:
             return False
 
@@ -249,14 +266,26 @@ ds_clean = ds.filter(commit_filter, num_proc=30)
 
 print("After commit filtering, the dataset size is {}".format(len(ds_clean)))
 
-ds_clean = ds_clean.filter(sub_sampling_based_on_proba, num_proc=30)
-print("After high proba filtering, the dataset size is {}".format(len(ds_clean)))
+if PROBA_SOFT_RESAMPLING:
+    # repeat the dataset to make it larger
+    ds_clean = concatenate_datasets([ds_clean] * SAMPLE_REPEAT_TIMES)
+
+    def sub_sampling_based_on_proba(example):
+        proba = example["proba"]
+        if proba > SOFT_PROBA_THRESHOLD:
+            return True
+        elif random.random() < LOW_QUALITY_SAMPLING_PROB:
+            return True
+        return False
+
+
+    ds_clean = ds_clean.filter(sub_sampling_based_on_proba, num_proc=30)
+    print("After high proba filtering, the dataset size is {}".format(len(ds_clean)))
 
 
 def prepare_code(example):
     if np.random.random() < FULL_RANGE_FRAC:
-        example["content"] = f"<commit_before>{example['old_contents']}<commit_msg>{example['subject']}<commit_after>{example['new_contents']}"
-        example["size"] = len(example["content"])
+        example["size"] = len(f"<commit_before>{example['old_contents']}<commit_msg>{example['subject']}<commit_after>{example['new_contents']}")
     else:
         start_offset = np.random.randint(MIN_RANGE, MAX_RANGE)
         end_offset = np.random.randint(MIN_RANGE, MAX_RANGE)
@@ -272,25 +301,31 @@ def prepare_code(example):
 
         code_before = "\n".join(old_lines[old_start:old_end])
         code_after = "\n".join(new_lines[new_start:new_end])
-        example["content"] = f"<commit_before>{code_before}<commit_msg>{example['subject']}<commit_after>{code_after}"
-        example["size"] = len(example["content"])
+
+        # rewrite the old and new contents
+        example["old_contents"] = code_before
+        example["new_contents"] = code_after
+        example["size"] = len(f"<commit_before>{code_before}<commit_msg>{example['subject']}<commit_after>{code_after}")
     return example
 
 
 ds_clean = ds_clean.map(prepare_code, num_proc=30)
 
+# remove the samples that are too long
+ds_clean = ds_clean.filter(lambda x: x["size"] < 4.0 * 2048, num_proc=30)
+
 ds_final = ds_clean.remove_columns(
-    ["subject", "message", "new_contents", "old_contents", "returncode", "stderr", "old_change_start", "old_change_end",
-     "old_change_range", "new_change_start", 'new_change_end', 'new_change_range', 'n_inserts', 'n_deletes',
-     'n_changes', 'drop_opt_out'])
+    ["message", "returncode", "stderr", "old_change_start", "old_change_end",
+     "old_change_range", "new_change_start", 'new_change_end', 'new_change_range', 'n_inserts', 'n_deletes', 'n_changes'])
 
 print("Finish the data cleaning, the final dataset size is {}".format(len(ds_final)))
 
-# add metadata
-ds_final.description = "The dataset is built with the following hyper-parameter: \n"\
-                       f"FULL_RANGE_FRAC: {FULL_RANGE_FRAC}, MIN_RANGE: {MIN_RANGE}, MAX_RANGE: {MAX_RANGE}, "\
-                        f"PROBA_THRESHOLD: {PROBA_THRESHOLD}, SHORT_SAMPLING: {SHORT_SAMPLING}, "\
-                        f"LONG_SAMPLING: {LONG_SAMPLING}, MD_SAMPLING: {MD_SAMPLING}, DATA_SAMPLING: {DATA_SAMPLING}, "\
-                        f"LOW_QUALITY_SAMPLING: {LOW_QUALITY_SAMPLING}, SAMPLE_TIME: {SAMPLE_TIME}"
+with open("dataset_description.json", "a+") as f:
+    f.write(json.dumps({
+        "dataset_size": len(ds_final),
+        "dataset_name": PUSH_DATASET_NAME,
+        "dataset_description": dataset_description
+    }) + "\n")
 
 ds_final.push_to_hub(PUSH_DATASET_NAME, private=True)
+ds_final.update()

@@ -3,7 +3,7 @@ from multiprocessing import Pool, Value
 import os
 import random
 import re
-
+import itertools
 import datasets
 from huggingface_hub import hf_hub_download
 import numpy as np
@@ -183,22 +183,15 @@ elif MODEL == "codegeex":
         "objective-c++", "scala", "kotlin", "pascal", "fortran", "r", "cuda", "c#"
     ]
 
-# 1.0 mean keep all short commit messages
-SHORT_SAMPLING = 1.0
-LONG_SAMPLING = 1.0
-LONG_SAMPLING_THRESHOLD = 500
 # the ratio to control how many examples are fully shown in the model input, 0.2 means 20% examples will have
-# the full code context such as the whole code file as the input
-FULL_RANGE_FRAC = 0.5
 # the minimum range and the maximum range represent the minimum context lines and the maximum context lines as the code context
-MIN_RANGE = 0
-MAX_RANGE = 32
-
 NUM_PROC = 64
+MAX_LENGTH = 2048
 
 # take all the data
 DATA_SAMPLING = 1.0
 DATA_EXT = {"json", "yml", "xml", "html"}
+DEBUG_MODE = False
 
 BAD_SUB_MESSAGE = [
     "auto commit",
@@ -220,20 +213,10 @@ BAD_MESSAGE = [
     "updated readme.md",
     "updated readme",
 ]
-CACHE_DIR = "/dev/cache/liuqian/datasets/instruction-commits"
-DATASET_NAME = "bigcode/instruction-commits"
-PUSH_DATASET_NAME = "bigcode/commits-pjj-2048-0.5"
-dataset_description = "This dataset is built with the following parameters: \n" \
-                        f"The sampling parameters to balance the code modification range as:\n" \
-                        f"  SHORT_SAMPLING: {SHORT_SAMPLING}\n" \
-                        f"  LONG_SAMPLING: {LONG_SAMPLING}\n" \
-                        f"  LONG_SAMPLING_THRESHOLD: {LONG_SAMPLING_THRESHOLD}\n" \
-                        f"The sampling parameters to balance the programming language as:\n" \
-                        f"  DATA_SAMPLING: {DATA_SAMPLING}\n" \
-                        f"The sampling parameters to control the code context range as:\n" \
-                        f"  FULL_RANGE_FRAC: {FULL_RANGE_FRAC}\n" \
-                        f"  MIN_RANGE: {MIN_RANGE}\n" \
-                        f"  MAX_RANGE: {MAX_RANGE}\n"
+CACHE_DIR = "/dev/cache/liuqian/datasets/github-commits-diff-dedup-pjjs-april"
+DATASET_NAME = "bigcode/github-commits-diff-dedup-pjjs-april"
+PUSH_DATASET_NAME = "bigcode/commits-pjj-2048-dedup"
+dataset_description = "Hi"
 
 ### SAMPLE ###
 # BASE_DIR = "data"
@@ -252,18 +235,24 @@ def init(args):
 
 def prepare_download_files():
     downloaded_files = []
-    for i in range(1, 459):
-        downloaded_files.append("data/python/python-{:04d}.jsonl".format(i))
+    for i in range(0, 200):
+        downloaded_files.append("data/python/part_{:04d}.parquet".format(i))
 
-    for i in range(1, 517):
-        downloaded_files.append("data/javascript/javascript-{:04d}.jsonl".format(i))
+    for i in range(0, 200):
+        downloaded_files.append("data/javascript/part_{:04d}.parquet".format(i))
 
-    for i in range(1, 250):
-        downloaded_files.append("data/java/java-{:04d}.jsonl".format(i))
+    for i in range(0, 100):
+        downloaded_files.append("data/java/part_{:04d}.parquet".format(i))
     return downloaded_files
 
 
-data_files = prepare_download_files()
+if DEBUG_MODE:
+    data_files = prepare_download_files()[:3]
+    NUM_PROC = 1
+    PUSH_DATASET_NAME = "none"
+    CACHE_DIR = "/tmp/data"
+else:
+    data_files = prepare_download_files()
 
 
 def download_file(file):
@@ -307,17 +296,23 @@ print("The dataset size is: {}".format(len(ds)))
 
 
 def get_line_diff_range(example):
-    old_file_start = None
-    old_file_end = 0
+    old_lines = example["old_contents"].splitlines()
+    new_lines = example["new_contents"].splitlines()
+    diff_regions = list(SequenceMatcher(None, old_lines, new_lines).get_grouped_opcodes())
 
-    new_file_start = None
-    new_file_end = 0
+    # record all possible results
+    results = []
+    for group in diff_regions:
+        # initialize the start and end of the old file and the new file
+        old_file_start = None
+        old_file_end = 0
 
-    n_inserts = 0
-    n_deletes = 0
+        new_file_start = None
+        new_file_end = 0
 
-    for group in SequenceMatcher(None, example["old_contents"].splitlines(),
-                                 example["new_contents"].splitlines()).get_grouped_opcodes():
+        n_inserts = 0
+        n_deletes = 0
+
         group = [g for g in group if g[0] != "equal"]
 
         for element in group:
@@ -345,24 +340,48 @@ def get_line_diff_range(example):
             new_file_start = min(file2_range[0], new_file_start)
         new_file_end = max(file2_range[1], new_file_end)
 
-    if old_file_start is None:
-        old_file_start = 0
-    if new_file_start is None:
-        new_file_start = 0
-    # -2 for compatibility with gh_diff
-    example["old_change_start"] = old_file_start
-    example["old_change_end"] = old_file_end
-    example["old_change_range"] = old_file_end - old_file_start
+        if old_file_start is None:
+            old_file_start = 0
+        if new_file_start is None:
+            new_file_start = 0
+        new_example = example.copy()
+        # -2 for compatibility with gh_diff
+        new_example["old_change_start"] = old_file_start
+        new_example["old_change_end"] = old_file_end
+        new_example["old_change_range"] = old_file_end - old_file_start
 
-    example["new_change_start"] = new_file_start
-    example["new_change_end"] = new_file_end
-    example["new_change_range"] = new_file_end - new_file_start
+        new_example["new_change_start"] = new_file_start
+        new_example["new_change_end"] = new_file_end
+        new_example["new_change_range"] = new_file_end - new_file_start
 
-    example["n_inserts"] = n_inserts
-    example["n_deletes"] = n_deletes
-    example["n_changes"] = n_inserts + n_deletes
+        new_example["n_inserts"] = n_inserts
+        new_example["n_deletes"] = n_deletes
+        new_example["n_changes"] = n_inserts + n_deletes
 
-    return example
+        # we use a simple strategy to split the context content if they cannot be fit into the max length
+        # here we use two blank lines to detect the possible split point in the old file
+        old_lines_len = len(old_lines)
+        possible_split_start, possible_split_end = [0], []
+        for i in range(old_lines_len - 1):
+            if old_lines[i] == "" and old_lines[i + 1] == "":
+                # append the next because it begins a new part
+                if i + 2 < old_file_start:
+                    possible_split_start.append(i + 2)
+                elif i > old_file_end:
+                    possible_split_end.append(i)
+        possible_split_end.append(old_lines_len)
+        # from large to small
+        new_example["possible_split_start"] = possible_split_start
+        # closer means higher probability
+        total_split_len = len(possible_split_start)
+        new_example["possible_split_start_prob"] = [1 / (total_split_len - i) for i in range(len(possible_split_start))]
+
+        new_example["possible_split_end"] = possible_split_end
+        # closer means higher probability
+        new_example["possible_split_end_prob"] = [1 / (i + 1) for i in range(len(possible_split_end))]
+        # add the example
+        results.append(new_example)
+    return results
 
 
 def clean_issues_and_refs(example):
@@ -430,22 +449,24 @@ ds = ds.filter(filter_empty_messages, num_proc=NUM_PROC)
 
 print("After empty message filtering due to messages with []:, the dataset size is: {}".format(len(ds)))
 
-ds = ds.map(get_line_diff_range, num_proc=NUM_PROC)
+# ds = ds.map(get_line_diff_range, num_proc=NUM_PROC)
+# ds = itertools.chain.from_iterable(ds)
 
 
-def filter_length(example):
-    if example["old_change_range"] <= 2:
-        if random.random() > SHORT_SAMPLING:
-            return False
+# def filter_length(example):
+#     # we should not do that because the old file can be empty
+#     # if example["old_change_range"] <= 2:
+#     #     if random.random() > SHORT_SAMPLING:
+#     #         return False
+#
+#     if example["old_change_range"] >= LONG_SAMPLING_THRESHOLD:
+#         if random.random() > LONG_SAMPLING:
+#             return False
+#
+#     return True
 
-    if example["old_change_range"] >= LONG_SAMPLING_THRESHOLD:
-        if random.random() > LONG_SAMPLING:
-            return False
 
-    return True
-
-
-ds = ds.filter(filter_length, num_proc=NUM_PROC)
+# ds = ds.filter(filter_length, num_proc=NUM_PROC)
 
 
 def filter_distribution(example):
@@ -525,34 +546,36 @@ print("After decontamination, the dataset size is {}".format(len(ds)))
 
 
 def prepare_code(example):
-    if np.random.random() < FULL_RANGE_FRAC:
-        file_name = example["old_file"].split("/")[-1]
-        code_before = example["old_contents"]
-        code_after = example["new_contents"]
-        example["content"] = f"<file_name>\n{file_name}\n<commit_before>\n{code_before}\n<commit_msg>\n{example['subject']}\n<commit_after>\n{code_after}"
-        example["size"] = len(example["content"])
-    else:
-        start_offset = np.random.randint(MIN_RANGE, MAX_RANGE)
-        end_offset = np.random.randint(MIN_RANGE, MAX_RANGE)
+    # by default, we leverage all content
+    file_name = example["old_file"].split("/")[-1]
+    code_before = example["old_contents"]
+    code_after = example["new_contents"]
+    example["content"] = f"<file_name>\n{file_name}\n<commit_before>\n{code_before}\n<commit_msg>\n{example['subject']}\n<commit_after>\n{code_after}"
+    # content_size = len(example["content"])
 
-        old_lines = example["old_contents"].splitlines()
-        new_lines = example["new_contents"].splitlines()
-
-        old_start = max(0, example["old_change_start"] - start_offset)
-        new_start = max(0, example["new_change_start"] - start_offset)
-
-        old_end = min(len(old_lines), example["old_change_end"] + end_offset)
-        new_end = min(len(new_lines), example["new_change_end"] + end_offset)
-
-        code_before = "\n".join(old_lines[old_start:old_end])
-        code_after = "\n".join(new_lines[new_start:new_end])
-
-        example["old_contents"] = code_before
-        example["new_contents"] = code_after
-        file_name = example["old_file"].split("/")[-1]
-
-        example["content"] = f"<file_name>\n{file_name}\n<commit_before>\n{code_before}\n<commit_msg>\n{example['subject']}\n<commit_after>\n{code_after}"
-        example["size"] = len(example["content"])
+    # if you cannot fit the content into 2048 tokens
+    # if content_size > 4.0 * MAX_LENGTH:
+    #     old_lines = example["old_contents"].splitlines()
+    #     start_pos_list = example["possible_split_start"]
+    #     new_lines = example["new_contents"].splitlines()
+    #     end_pos_list = example["possible_split_end"]
+    #
+    #     start_offset = example["old_change_start"] - random.choice(start_pos_list)
+    #     end_offset = random.choice(end_pos_list) - example["new_change_end"]
+    #
+    #     # try to expand the context
+    #     old_start = max(0, example["old_change_start"] - start_offset)
+    #     new_start = max(0, example["new_change_start"] - start_offset)
+    #
+    #     old_end = min(len(old_lines), example["old_change_end"] + end_offset)
+    #     new_end = min(len(new_lines), example["new_change_end"] + end_offset)
+    #
+    #     code_before = "\n".join(old_lines[old_start:old_end])
+    #     code_after = "\n".join(new_lines[new_start:new_end])
+    #
+    #     example["old_contents"] = code_before
+    #     example["new_contents"] = code_after
+    #     example["content"] = f"<file_name>\n{file_name}\n<commit_before>\n{code_before}\n<commit_msg>\n{example['subject']}\n<commit_after>\n{code_after}"
     return example
 
 
@@ -574,7 +597,7 @@ if MODEL == "santacoder":
 
     tokenizer = AutoTokenizer.from_pretrained("bigcode/santacoder")
     # Filter for texts with with less than 2048 tokens
-    ds = ds.filter(lambda x: len(tokenizer(x["content"])) <= 2048, num_proc=NUM_PROC)
+    ds = ds.filter(lambda x: len(tokenizer(x["content"])["input_ids"]) <= MAX_LENGTH, num_proc=NUM_PROC)
 elif MODEL == "bloomz":
     from transformers import AutoTokenizer
 
@@ -591,9 +614,9 @@ print("After length filtering, the dataset size is: {}".format(len(ds)))
 if MODEL == "santacoder":
     cols_to_select = ["commit", "old_file", "new_file", "old_contents", "new_contents", "subject", "lang"] + [
         "proba"] if "proba" in ds.column_names else []
-    cols_to_remove = [column_name for column_name in ds.column_names if column_name not in cols_to_select]
+    # cols_to_remove = [column_name for column_name in ds.column_names if column_name not in cols_to_select]
     print("Finally, the dataset size is {}".format(len(ds)))
-    ds = ds.remove_columns(cols_to_remove)
+    # ds = ds.remove_columns(cols_to_remove)
     ds.push_to_hub(PUSH_DATASET_NAME, private=True)
 
     with open("dataset_description.json", "a+") as f:

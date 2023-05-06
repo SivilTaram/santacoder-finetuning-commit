@@ -4,14 +4,20 @@ sed -i '/num_processes:/d' eval_config.yaml
 echo "num_processes: $num_gpus" >> eval_config.yaml
 
 cd evaluation
+git pull
 
 SANTACODER_DIR=/dev/cache/qian/checkpoints/santacoder
 export HF_MODULES_CACHE=$SANTACODER_DIR
 export PYTHONPATH=$PYTHONPATH:$SANTACODER_DIR
-MODEL_DIR=/dev/cache/qian/checkpoints/santacoder_v9_100k_instruction_strict_filter_with_input_loss
+MODEL_DIR=/dev/cache/qian/checkpoints/santacoder_v11_instruction_dedup
+sudo chmod -R 777 $MODEL_DIR
+sudo chmod -R 777 $SANTACODER_DIR
+MUTATE_METHOD=file
 
 # traverse all checkpoints
-for checkpoint_dir in $MODEL_DIR/checkpoint-*; do
+for (( i=39000; i>=3000; i-=3000 ))
+do
+  export checkpoint_dir=$MODEL_DIR/checkpoint-$i
   cp $SANTACODER_DIR/config.json $checkpoint_dir/config.json
   cp $SANTACODER_DIR/configuration_gpt2_mq.py $checkpoint_dir/configuration_gpt2_mq.py
   cp $SANTACODER_DIR/modeling_gpt2_mq.py $checkpoint_dir/modeling_gpt2_mq.py
@@ -27,7 +33,7 @@ for checkpoint_dir in $MODEL_DIR/checkpoint-*; do
   --batch_size 1 \
   --save_generations \
   --trust_remote_code \
-  --mutate_method edit \
+  --mutate_method $MUTATE_METHOD \
   --generations_path $checkpoint_dir/generations_humanevalxbugspy_greedy.json \
   --generation_only \
   --max_length_generation 1024
@@ -40,7 +46,7 @@ for checkpoint_dir in $MODEL_DIR/checkpoint-*; do
   --batch_size 1 \
   --save_generations \
   --trust_remote_code \
-  --mutate_method edit \
+  --mutate_method $MUTATE_METHOD \
   --generations_path $checkpoint_dir/generations_humanevalxbugsjs_greedy.json \
   --generation_only \
   --max_length_generation 1024
@@ -53,7 +59,7 @@ for checkpoint_dir in $MODEL_DIR/checkpoint-*; do
   --batch_size 1 \
   --save_generations \
   --trust_remote_code \
-  --mutate_method edit \
+  --mutate_method $MUTATE_METHOD \
   --generations_path $checkpoint_dir/generations_humanevalxbugsjava_greedy.json \
   --generation_only \
   --max_length_generation 1024
