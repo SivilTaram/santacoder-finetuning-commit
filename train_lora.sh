@@ -5,12 +5,12 @@ export HF_MODULES_CACHE=$SANTACODER_DIR
 export PYTHONPATH=$PYTHONPATH:$SANTACODER_DIR
 export OMP_NUM_THREADS=1
 
-accelerate launch --config_file config.yaml train.py \
+torchrun --nproc_per_node 8 train.py \
       --max_input_length 2048 \
       --dataset_name bigcode/commits-pjj-2048 \
-      --max_steps 100000 \
-      --batch_size 2 \
-      --gradient_accumulation_steps 4 \
+      --max_steps 20000 \
+      --batch_size 1 \
+      --gradient_accumulation_steps 8 \
       --learning_rate 5e-5 \
       --num_warmup_steps 1000 \
       --eval_freq 3000 \

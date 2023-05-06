@@ -22,7 +22,43 @@ from transformers import (
 )
 import numpy as np
 from transformers import AutoModelForSeq2SeqLM
-from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_int8_training
+from peft import LoraConfig, get_peft_model, prepare_model_for_int8_training, set_peft_model_state_dict
+from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+from accelerate import Accelerator
+
+
+class SavePeftModelCallback(TrainerCallback):
+    def on_save(
+            self,
+            args: TrainingArguments,
+            state: TrainerState,
+            control: TrainerControl,
+            **kwargs,
+    ):
+        checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+
+        kwargs["model"].save_pretrained(checkpoint_folder)
+
+        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+        torch.save({}, pytorch_model_path)
+        return control
+
+
+class LoadBestPeftModelCallback(TrainerCallback):
+    def on_train_end(
+            self,
+            args: TrainingArguments,
+            state: TrainerState,
+            control: TrainerControl,
+            **kwargs,
+    ):
+        print(f"Loading best peft model from {state.best_model_checkpoint} (score: {state.best_metric}).")
+        best_model_path = os.path.join(state.best_model_checkpoint, "adapter_model.bin")
+        adapters_weights = torch.load(best_model_path)
+        model = kwargs["model"]
+        set_peft_model_state_dict(model, adapters_weights)
+        return control
 
 
 def get_args():
@@ -272,26 +308,22 @@ def run_training(args, train_data, val_data):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         trust_remote_code=True,
-        use_cache=not args.gradient_checkpointing
+        use_cache=not args.gradient_checkpointing,
+        load_in_8bit=True,
+        device_map={"": Accelerator().process_index},
     )
 
     if args.enable_lora:
-        if args.model_path == "bigcode/large-model":
-            target_modules = ["c_attn", "q_attn"]
-        else:
-            target_modules = ["kv_attn", "q_attn"]
-        config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=8,
-            lora_alpha=32,
+        model = prepare_model_for_int8_training(model)
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
             bias="none",
-            target_modules=target_modules,
-            lora_dropout=0.1)
-        # prepare 8-int model for training
-        if args.model_path == "bigcode/large-model":
-            model = prepare_model_for_int8_training(model)
-        model = get_peft_model(model, config)
+            task_type="CAUSAL_LM",
+            target_modules=["c_proj", "c_attn", "q_attn"]
+        )
+        model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
     print("Model loaded")
@@ -327,15 +359,25 @@ def run_training(args, train_data, val_data):
         pad_to_multiple_of=8 if training_args.fp16 else None,
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_data,
-        eval_dataset=val_data,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        # callbacks=[EvaluateDebugCallback()]
-    )
+    if args.enable_lora:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_data,
+            eval_dataset=val_data,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            callbacks=[SavePeftModelCallback, LoadBestPeftModelCallback]
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_data,
+            eval_dataset=val_data,
+            tokenizer=tokenizer,
+            data_collator=data_collator
+        )
 
     print("Training...")
     trainer.train()
