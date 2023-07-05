@@ -20,9 +20,9 @@ from transformers import (
     TrainerCallback,
     AutoConfig
 )
+import difflib
 import numpy as np
 from transformers import AutoModelForSeq2SeqLM
-from peft import LoraConfig, TaskType, get_peft_model
 
 
 def get_args():
@@ -66,7 +66,7 @@ def get_args():
     parser.add_argument("--data_packing", default=False, action="store_true")
     parser.add_argument("--add_file_name", default=False, action="store_true")
     parser.add_argument("--flan_file_path", type=str, default=None)
-    parser.add_argument("--enable_lora", default=False, action="store_true")
+    parser.add_argument("--diff_line", default=False, action="store_true")
 
     return parser.parse_args()
 
@@ -169,6 +169,32 @@ def create_datasets(args):
 
     dataset = dataset.train_test_split(test_size=0.005, seed=args.seed)
 
+
+    def generate_line_diff(original_code, modified_code):
+        original_code = original_code.strip()
+        modified_code = modified_code.strip()
+        original_lines = original_code.splitlines(keepends=True)
+        modified_lines = modified_code.splitlines(keepends=True)
+
+        # Add line numbers to original and modified code
+        original_code_with_line_numbers = ''.join(f"{i + 1:3d} {line}" for i, line in enumerate(original_lines))
+        modified_code_with_line_numbers = ''.join(f"{i + 1:3d} {line}" for i, line in enumerate(modified_lines))
+
+        diff = difflib.unified_diff(original_code_with_line_numbers.splitlines(),
+                                    modified_code_with_line_numbers.splitlines(), 
+                                    fromfile='Original', 
+                                    tofile='Modified', 
+                                    lineterm='')
+        # remove the first line and second line
+        # print(diff)
+        try:
+            next(diff)
+            next(diff)
+            diff_with_line_numbers = '\n'.join(f"{line}" for line in diff if line.startswith(('+', '-')))
+            return original_code_with_line_numbers, diff_with_line_numbers
+        except StopIteration:
+            return original_code_with_line_numbers, ""
+
     def unify_format(examples):
         if args.flan_file_path is not None:
             input_template = "Instructions: {instruction}\nInput:\n{input}\nOutput:\n"
@@ -208,12 +234,25 @@ def create_datasets(args):
                     for sub_example, new_example in zip(examples["subject"], examples["new_contents"])
                 ]
             else:
-                inputs = [
-                    input_template.format(input=content.strip(), instruction=message.strip())
-                    for content, message in zip(examples["old_contents"], examples["subject"])
-                ]
-                targets = examples["new_contents"]
+                # if apply diff
+                if args.diff_line:
+                    # compute the line-level diff
+                    diff_results = [
+                        generate_line_diff(content, new_content)
+                        for content, new_content in zip(examples["old_contents"], examples["new_contents"])
+                    ]
+                    inputs, targets = [], []
+                    for i, (content, diff_content) in enumerate(diff_results):
+                        inputs.append(input_template.format(input=content.strip(), instruction=examples["subject"][i].strip()))
+                        targets.append(diff_content)
+                else:
+                    inputs = [
+                        input_template.format(input=content.strip(), instruction=message.strip())
+                        for content, message in zip(examples["old_contents"], examples["subject"])
+                    ]
+                    targets = examples["new_contents"]
 
+                    
         if args.add_file_name:
             file_names = [file_path.split("/")[-1] for file_path in examples["old_file"]]
             inputs = [f"<file_name>\n{file_name}\n{inp}" for file_name, inp in zip(file_names, inputs)]
@@ -274,17 +313,6 @@ def run_training(args, train_data, val_data):
         trust_remote_code=True,
         use_cache=not args.gradient_checkpointing
     )
-
-    if args.enable_lora:
-        config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            inference_mode=False,
-            r=8,
-            lora_alpha=32,
-            target_modules=["q_attn", "kv_attn"],
-            lora_dropout=0.1)
-        model = get_peft_model(model, config)
-        model.print_trainable_parameters()
 
     print("Model loaded")
     train_data.start_iteration = 0
